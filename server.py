@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import json
 import logging
 
+# Настройка логов, чтобы видеть ошибки в панели Render
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DeepDriftRelay")
 
@@ -10,18 +11,20 @@ active_connections = {}
 
 @app.get("/")
 async def root():
-    return {"status": "DeepDrift Relay Online", "online_units": list(active_connections.keys())}
+    return {
+        "status": "DeepDrift Relay Online", 
+        "connected_uids": list(active_connections.keys())
+    }
 
-# Мы убрали генерацию рандомных чисел здесь. 
-# Теперь ID берется из пути: /chat/1234
 @app.websocket("/chat/{my_uid}")
 async def websocket_endpoint(websocket: WebSocket, my_uid: str):
     await websocket.accept()
     
+    # Регистрируем пользователя
     active_connections[my_uid] = websocket
-    logger.info(f"✅ User {my_uid} authenticated and online.")
+    logger.info(f"CONNECTED: {my_uid}")
     
-    # Подтверждаем клиенту, что он в сети
+    # Подтверждаем клиенту
     await websocket.send_text(json.dumps({
         "type": "uid_assigned",
         "uid": my_uid
@@ -43,15 +46,14 @@ async def websocket_endpoint(websocket: WebSocket, my_uid: str):
                     "encrypted_payload": payload,
                     "fhrg_sig": fhrg_sig
                 }))
-                logger.info(f"📨 {my_uid} -> {target}")
+                logger.info(f"FORWARD: {my_uid} -> {target}")
             else:
                 await websocket.send_text(json.dumps({
                     "type": "error",
-                    "error": "Target user is offline",
-                    "target_uid": target
+                    "error": f"User {target} is offline"
                 }))
     except Exception as e:
-        logger.info(f"🔴 connection closed for {my_uid}")
+        logger.info(f"DISCONNECT: {my_uid} (Error: {e})")
     finally:
         if my_uid in active_connections:
             del active_connections[my_uid]
