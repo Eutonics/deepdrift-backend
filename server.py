@@ -1,59 +1,59 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import json
 import random
-import datetime
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DeepDriftRelay")
 
 app = FastAPI()
 active_connections = {}
 
 @app.get("/")
 async def root():
-    # Это нужно, чтобы ты мог просто открыть ссылку в браузере и "разбудить" сервер
-    return {
-        "status": "DeepDrift Relay Online",
-        "time": datetime.datetime.now().isoformat(),
-        "active_users": len(active_connections)
-    }
+    return {"status": "DeepDrift Online", "active_users": len(active_connections)}
 
-@app.websocket("/chat")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/{full_path:path}")
+async def websocket_endpoint(websocket: WebSocket, full_path: str):
     await websocket.accept()
     
-    # 1. СРАЗУ генерируем временный UID и шлем его телефону
-    # Это разорвет "мертвый замок"
-    temp_uid = str(random.randint(100000, 999999))
-    active_connections[temp_uid] = websocket
+    # Генерация UID
+    uid = str(random.randint(100000, 999999))
+    active_connections[uid] = websocket
     
-    await websocket.send_text(json.dumps({
-        "type": "welcome",
-        "my_uid": temp_uid,
-        "message": "Connected to DeepDrift Cloud"
-    }))
+    # ВАЖНО: Шлем ровно то, что ждет home_screen.dart (тип uid_assigned)
+    welcome_packet = {
+        "type": "uid_assigned",
+        "uid": uid
+    }
     
-    print(f"🟢 User {temp_uid} connected")
+    await websocket.send_text(json.dumps(welcome_packet))
+    logger.info(f"✅ User {uid} assigned and connected.")
     
     try:
         while True:
-            # Слушаем сообщения
             raw_data = await websocket.receive_text()
             data = json.loads(raw_data)
             
+            # Логика пересылки из chat_screen.dart
             target = data.get("target_uid")
-            payload = data.get("payload")
+            payload = data.get("encrypted_payload") # Ждем этот ключ
             
             if target in active_connections:
                 await active_connections[target].send_text(json.dumps({
-                    "from_uid": temp_uid,
-                    "payload": payload,
-                    "fhrg_sig": data.get("fhrg_sig")
+                    "type": "message",
+                    "from_uid": uid,
+                    "encrypted_payload": payload # Шлем этот ключ
                 }))
+                logger.info(f"📨 {uid} -> {target}")
             else:
+                # Если цель офлайн, шлем ошибку как просит chat_screen.dart
                 await websocket.send_text(json.dumps({
-                    "type": "error", 
-                    "message": f"Target {target} not found"
+                    "type": "error",
+                    "error": "User is offline"
                 }))
-                
-    except WebSocketDisconnect:
-        if temp_uid in active_connections:
-            del active_connections[temp_uid]
-        print(f"🔴 User {temp_uid} disconnected")
+    except Exception as e:
+        logger.info(f"🔴 Connection closed for {uid}: {e}")
+    finally:
+        if uid in active_connections:
+            del active_connections[uid]
