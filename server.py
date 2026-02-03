@@ -11,7 +11,7 @@ active_connections = {}
 
 @app.get("/")
 async def root():
-    return {"status": "DeepDrift Online", "active_users": len(active_connections)}
+    return {"status": "DeepDrift Relay Online", "active_users": len(active_connections)}
 
 @app.websocket("/{full_path:path}")
 async def websocket_endpoint(websocket: WebSocket, full_path: str):
@@ -21,36 +21,37 @@ async def websocket_endpoint(websocket: WebSocket, full_path: str):
     uid = str(random.randint(100000, 999999))
     active_connections[uid] = websocket
     
-    # ВАЖНО: Шлем ровно то, что ждет home_screen.dart (тип uid_assigned)
+    # Пакет приветствия: Формат в точности как ждет мобильное приложение
     welcome_packet = {
         "type": "uid_assigned",
         "uid": uid
     }
     
     await websocket.send_text(json.dumps(welcome_packet))
-    logger.info(f"✅ User {uid} assigned and connected.")
+    logger.info(f"✅ User {uid} connected via /{full_path}")
     
     try:
         while True:
             raw_data = await websocket.receive_text()
             data = json.loads(raw_data)
             
-            # Логика пересылки из chat_screen.dart
+            # Логика пересылки
             target = data.get("target_uid")
-            payload = data.get("encrypted_payload") # Ждем этот ключ
+            payload = data.get("encrypted_payload")
+            fhrg_sig = data.get("fhrg_sig")
             
             if target in active_connections:
                 await active_connections[target].send_text(json.dumps({
                     "type": "message",
                     "from_uid": uid,
-                    "encrypted_payload": payload # Шлем этот ключ
+                    "encrypted_payload": payload,
+                    "fhrg_sig": fhrg_sig
                 }))
-                logger.info(f"📨 {uid} -> {target}")
+                logger.info(f"📨 Route: {uid} -> {target}")
             else:
-                # Если цель офлайн, шлем ошибку как просит chat_screen.dart
                 await websocket.send_text(json.dumps({
                     "type": "error",
-                    "error": "User is offline"
+                    "error": "Target user is offline"
                 }))
     except Exception as e:
         logger.info(f"🔴 Connection closed for {uid}: {e}")
