@@ -1,43 +1,59 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import json
+import random
+import datetime
 
 app = FastAPI()
 active_connections = {}
 
 @app.get("/")
 async def root():
-    return {"status": "DeepDrift Relay Online"}
+    # Это нужно, чтобы ты мог просто открыть ссылку в браузере и "разбудить" сервер
+    return {
+        "status": "DeepDrift Relay Online",
+        "time": datetime.datetime.now().isoformat(),
+        "active_users": len(active_connections)
+    }
 
-# Сделали путь /chat, как в твоем приложении на скриншоте
 @app.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    # Ждем первое сообщение от клиента с его UID
+    
+    # 1. СРАЗУ генерируем временный UID и шлем его телефону
+    # Это разорвет "мертвый замок"
+    temp_uid = str(random.randint(100000, 999999))
+    active_connections[temp_uid] = websocket
+    
+    await websocket.send_text(json.dumps({
+        "type": "welcome",
+        "my_uid": temp_uid,
+        "message": "Connected to DeepDrift Cloud"
+    }))
+    
+    print(f"🟢 User {temp_uid} connected")
+    
     try:
-        initial_data = await websocket.receive_text()
-        data = json.loads(initial_data)
-        my_uid = data.get("my_uid", "unknown")
-        
-        active_connections[my_uid] = websocket
-        print(f"🟢 User {my_uid} connected via /chat")
-        
         while True:
+            # Слушаем сообщения
             raw_data = await websocket.receive_text()
-            msg_data = json.loads(raw_data)
-            target = msg_data.get("target_uid")
+            data = json.loads(raw_data)
+            
+            target = data.get("target_uid")
+            payload = data.get("payload")
             
             if target in active_connections:
                 await active_connections[target].send_text(json.dumps({
-                    "from_uid": my_uid,
-                    "payload": msg_data.get("payload"),
-                    "fhrg_sig": msg_data.get("fhrg_sig")
+                    "from_uid": temp_uid,
+                    "payload": payload,
+                    "fhrg_sig": data.get("fhrg_sig")
                 }))
             else:
-                await websocket.send_text(json.dumps({"error": "Target offline"}))
+                await websocket.send_text(json.dumps({
+                    "type": "error", 
+                    "message": f"Target {target} not found"
+                }))
                 
     except WebSocketDisconnect:
-        # Убираем из списка при дисконнекте
-        for uid, ws in list(active_connections.items()):
-            if ws == websocket:
-                del active_connections[uid]
-                print(f"🔴 User {uid} disconnected")
+        if temp_uid in active_connections:
+            del active_connections[temp_uid]
+        print(f"🔴 User {temp_uid} disconnected")
