@@ -56,4 +56,4 @@ async def websocket_endpoint(websocket: WebSocket, my_uid: str):
         logger.info(f"DISCONNECT: {my_uid} (Error: {e})")
     finally:
         if my_uid in active_connections:
-            del active_connections[my_uid]
+            del active_connections[my_uid] 
