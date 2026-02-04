@@ -2,13 +2,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import logging
+import asyncio
 from datetime import datetime
-from typing import Dict, List
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("DeepDriftRelay")
 
-app = FastAPI(title="DeepDrift Relay v10.1")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,51 +18,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-active_connections: Dict[str, WebSocket] = {}
-offline_inbox: Dict[str, List[dict]] = {}
+active_connections = {}
+offline_inbox = {}
 
 @app.get("/")
 async def health():
-    return {
-        "status": "DeepDrift Relay v10.1 ONLINE",
-        "online_users": list(active_connections.keys()),
-        "offline_inbox": {k: len(v) for k, v in offline_inbox.items() if v}
-    }
+    return {"status": "ONLINE v11", "users": list(active_connections.keys())}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    my_uid: str | None = None
-    logger.info("🔌 New WebSocket connection")
-
+    my_uid = None
+    
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             msg_type = data.get("type")
 
-            # 1. АВТОРИЗАЦИЯ
-            if msg_type in ("init", "uid_assigned"):
-                uid = data.get("my_uid") or data.get("uid")
-                if not uid: continue
-                active_connections[uid] = websocket
-                my_uid = uid
-                logger.info(f"✅ UID {uid} bound to socket")
-                await websocket.send_text(json.dumps({"type": "uid_assigned", "uid": uid}))
-
-                if uid in offline_inbox and offline_inbox[uid]:
-                    for msg in offline_inbox[uid]:
+            if msg_type == "init":
+                my_uid = data.get("my_uid")
+                active_connections[my_uid] = websocket
+                logger.info(f"✅ UID {my_uid} Online")
+                await websocket.send_text(json.dumps({"type": "uid_assigned", "uid": my_uid}))
+                
+                # СРАЗУ отдаем оффлайн сообщения
+                if my_uid in offline_inbox and offline_inbox[my_uid]:
+                    for msg in offline_inbox[my_uid]:
                         await websocket.send_text(json.dumps(msg))
-                    offline_inbox[uid].clear()
+                    offline_inbox[my_uid] = []
                 continue
 
-            # 2. ПИНГ
             if msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong", "ts": datetime.utcnow().isoformat()}))
+                await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
-            # 3. ПОДТВЕРЖДЕНИЕ ДОСТАВКИ (Receipts)
-            # Если телефон прислал квитанцию, пробрасываем её отправителю
             if msg_type == "delivery_receipt":
                 target = data.get("target_uid")
                 if target in active_connections:
@@ -73,7 +63,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                 continue
 
-            # 4. МАРШРУТИЗАЦИЯ СООБЩЕНИЙ
+            # Роутинг сообщений
             target_uid = data.get("target_uid")
             if not target_uid or not my_uid: continue
 
@@ -89,25 +79,14 @@ async def websocket_endpoint(websocket: WebSocket):
             if target_uid in active_connections:
                 try:
                     await active_connections[target_uid].send_text(json.dumps(payload))
-                    logger.info(f"📨 {my_uid} → {target_uid} (LIVE)")
                 except:
                     offline_inbox.setdefault(target_uid, []).append(payload)
             else:
                 offline_inbox.setdefault(target_uid, []).append(payload)
-                logger.info(f"📥 {my_uid} → {target_uid} (OFFLINE)")
 
-            # Отправляем отправителю статус "Ушло на сервер" (Первая галочка)
-            await websocket.send_text(json.dumps({
-                "type": "status_update",
-                "id": payload["id"],
-                "status": "sent"
-            }))
+            # Отклик отправителю (одна галочка)
+            await websocket.send_text(json.dumps({"type": "status_update", "id": data.get("id"), "status": "sent"}))
 
-    except WebSocketDisconnect:
-        logger.info(f"🔴 Socket disconnected (uid={my_uid})")
-    except Exception as e:
-        logger.error(f"🔥 Error (uid={my_uid}): {e}")
-    finally:
+    except Exception:
         if my_uid and active_connections.get(my_uid) is websocket:
             del active_connections[my_uid]
-            logger.info(f"❌ UID {my_uid} unbound")
