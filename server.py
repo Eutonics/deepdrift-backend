@@ -1,4 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware  # <-- ВАЖНО
 import json
 import logging
 from datetime import datetime
@@ -7,41 +8,52 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DeepDriftRelay")
 
 app = FastAPI()
+
+# 1. РАЗРЕШАЕМ ВСЕ ПОДКЛЮЧЕНИЯ (Фикс 403 Forbidden)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешить всем
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 active_connections = {}
 
 @app.get("/")
 async def root():
-    # Показываем, кто реально сейчас подключен
     return {
-        "status": "DeepDrift Relay v6", 
+        "status": "DeepDrift Relay v7 (CORS Fixed)", 
         "active_users_count": len(active_connections),
         "users_online": list(active_connections.keys())
     }
 
-# ВАЖНОЕ ИЗМЕНЕНИЕ: Мы явно ловим client_uid из URL
 @app.websocket("/chat/{client_uid}")
 async def websocket_endpoint(websocket: WebSocket, client_uid: str):
+    # 2. ПРИНУДИТЕЛЬНОЕ ПРИНЯТИЕ СОЕДИНЕНИЯ
     await websocket.accept()
     
-    # Если такой ID уже есть - отключаем старого (перехват сессии)
+    # Кикаем старую сессию, если ID занят
     if client_uid in active_connections:
         try:
             await active_connections[client_uid].close()
-            logger.info(f"♻️ Replaced existing session for {client_uid}")
+            logger.info(f"♻️ Reconnecting session for {client_uid}")
         except:
             pass
 
-    # ИСПОЛЬЗУЕМ ID, КОТОРЫЙ ПРИСЛАЛ ТЕЛЕФОН
     active_connections[client_uid] = websocket
+    logger.info(f"✅ User {client_uid} CONNECTED")
     
-    logger.info(f"✅ User {client_uid} connected manually")
-    
-    # Подтверждаем клиенту его же ID (чтобы снять спиннер загрузки)
-    await websocket.send_text(json.dumps({
-        "type": "uid_assigned",
-        "uid": client_uid,
-        "timestamp": datetime.now().isoformat()
-    }))
+    # Handshake
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "uid_assigned",
+            "uid": client_uid,
+            "timestamp": datetime.now().isoformat()
+        }))
+    except Exception as e:
+        logger.error(f"❌ Handshake failed for {client_uid}: {e}")
+        return
     
     try:
         while True:
@@ -51,7 +63,7 @@ async def websocket_endpoint(websocket: WebSocket, client_uid: str):
             msg_type = data.get("type", "message")
             target = data.get("target_uid")
             
-            # PING/PONG для поддержания связи
+            # PING/PONG (Keep-Alive)
             if msg_type == "ping":
                  await websocket.send_text(json.dumps({"type": "pong"}))
                  continue
@@ -59,24 +71,23 @@ async def websocket_endpoint(websocket: WebSocket, client_uid: str):
             if target and target in active_connections:
                 target_ws = active_connections[target]
                 
+                # ... Логика пересылки (как была) ...
                 if msg_type == "message":
-                    # Пересылаем сообщение
                     await target_ws.send_text(json.dumps({
                         "type": "message",
                         "id": data.get("id"),
-                        "from_uid": client_uid, # От кого реально пришло
+                        "from_uid": client_uid,
                         "encrypted_payload": data.get("encrypted_payload"),
                         "fhrg_sig": data.get("fhrg_sig"),
                         "timestamp": datetime.now().isoformat()
                     }))
                     
-                    # Шлем галочку "Sent" отправителю
+                    # Подтверждение отправки
                     await websocket.send_text(json.dumps({
                         "type": "status_update",
                         "id": data.get("id"),
                         "status": "sent"
                     }))
-                    
                     logger.info(f"📨 {client_uid} -> {target}")
                 
                 elif msg_type == "typing":
@@ -84,21 +95,16 @@ async def websocket_endpoint(websocket: WebSocket, client_uid: str):
                         "type": "typing",
                         "from_uid": client_uid
                     }))
-                
+                    
                 elif msg_type == "delivery_receipt":
-                    # Подтверждение доставки
                     await target_ws.send_text(json.dumps({
                         "type": "status_update",
                         "id": data.get("message_id"),
                         "status": "delivered"
                     }))
-                    
             else:
-                # Если получателя нет в списке
                 if msg_type == "message":
-                    logger.warning(f"❌ {client_uid} -> {target} (Target Offline)")
-                    # Можно отправить ошибку клиенту, но лучше просто промолчать или сохранить в очередь (в будущем)
-                    # Пока шлем ошибку, чтобы ты видел в дебаге
+                    logger.warning(f"❌ {client_uid} -> {target} (Offline)")
                     await websocket.send_text(json.dumps({
                         "type": "message_failed",
                         "msg_id": data.get("id"),
