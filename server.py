@@ -15,16 +15,15 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("DeepDriftRelay")
+logger = logging.getLogger("DDChatRelay")
 
-app = FastAPI(title="DeepDrift Secure Relay", version="2.0.0")
+app = FastAPI(title="DDChat Secure Relay", version="2.0.0")
 
-# CORS - ВАЖНО: замените на ваш домен в продакшене!
+# CORS
 ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://localhost:3000",
-    # В продакшене добавьте:
-    # "https://yourdomain.com",
+    # В продакшене добавьте свой домен
 ]
 
 app.add_middleware(
@@ -35,14 +34,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Redis для персистентности офлайн сообщений
-REDIS_URL = "redis://localhost:6379"  # Или используйте env переменную
+# Redis для персистентности
+REDIS_URL = "redis://localhost:6379"
 redis_client: Optional[redis.Redis] = None
 
 # In-memory хранилища
 active_connections: Dict[str, WebSocket] = {}
-user_tokens: Dict[str, str] = {}  # uid -> token для аутентификации
-message_counts = defaultdict(list)  # uid -> [timestamps] для rate limiting
+user_tokens: Dict[str, str] = {}
+message_counts = defaultdict(list)
+user_public_keys: Dict[str, Dict[str, str]] = {}  # uid -> {x25519_key, ed25519_key}
 
 # Константы
 MAX_MESSAGES_PER_MINUTE = 60
@@ -64,26 +64,22 @@ async def init_redis():
         logger.info("✅ Redis connected successfully")
     except Exception as e:
         logger.error(f"❌ Redis connection failed: {e}")
-        logger.warning("⚠️  Running without persistence - offline messages will be lost on restart")
+        logger.warning("⚠️  Running without persistence")
         redis_client = None
 
 
 async def save_offline_message(uid: str, message: dict):
     """Сохранение офлайн сообщения в Redis"""
     if redis_client is None:
-        # Fallback на in-memory (не рекомендуется для продакшена)
         return
     
     try:
         key = f"offline:{uid}"
         
-        # Проверяем количество сообщений
         count = await redis_client.llen(key)
         if count >= MAX_OFFLINE_MESSAGES:
-            # Удаляем самое старое сообщение
             await redis_client.rpop(key)
         
-        # Добавляем новое сообщение
         await redis_client.lpush(key, json.dumps(message))
         await redis_client.expire(key, OFFLINE_MESSAGE_TTL)
         
@@ -111,9 +107,47 @@ async def get_offline_messages(uid: str) -> List[dict]:
         return []
 
 
+async def save_public_key(uid: str, x25519_key: str, ed25519_key: Optional[str] = None):
+    """Сохраняет публичные ключи пользователя в Redis"""
+    if redis_client is None:
+        # Fallback на in-memory
+        user_public_keys[uid] = {
+            "x25519": x25519_key,
+            "ed25519": ed25519_key or ""
+        }
+        return
+    
+    try:
+        key = f"pubkey:{uid}"
+        data = {
+            "x25519": x25519_key,
+            "ed25519": ed25519_key or ""
+        }
+        await redis_client.set(key, json.dumps(data))
+        # Публичные ключи не истекают
+        logger.info(f"🔑 Saved public keys for {uid}")
+    except Exception as e:
+        logger.error(f"Failed to save public key: {e}")
+
+
+async def get_public_key(uid: str) -> Optional[Dict[str, str]]:
+    """Получает публичные ключи пользователя из Redis"""
+    if redis_client is None:
+        return user_public_keys.get(uid)
+    
+    try:
+        key = f"pubkey:{uid}"
+        data_raw = await redis_client.get(key)
+        if data_raw:
+            return json.loads(data_raw)
+        return None
+    except Exception as e:
+        logger.error(f"Failed to get public key: {e}")
+        return None
+
+
 def generate_auth_token(uid: str) -> str:
-    """Генерация токена аутентификации для пользователя"""
-    # В реальном приложении используйте JWT
+    """Генерация токена аутентификации"""
     token = secrets.token_urlsafe(32)
     user_tokens[uid] = token
     logger.info(f"🔑 Generated auth token for {uid}")
@@ -126,11 +160,10 @@ def verify_auth_token(uid: str, token: str) -> bool:
 
 
 def is_rate_limited(uid: str) -> bool:
-    """Проверка rate limiting для пользователя"""
+    """Проверка rate limiting"""
     now = datetime.utcnow()
     cutoff = now - timedelta(minutes=1)
     
-    # Очищаем старые записи
     message_counts[uid] = [ts for ts in message_counts[uid] if ts > cutoff]
     
     if len(message_counts[uid]) >= MAX_MESSAGES_PER_MINUTE:
@@ -143,14 +176,12 @@ def is_rate_limited(uid: str) -> bool:
 
 @app.on_event("startup")
 async def startup_event():
-    """Инициализация при запуске приложения"""
     await init_redis()
-    logger.info("🚀 DeepDrift Secure Relay v2.0 started")
+    logger.info("🚀 DDChat Secure Relay v2.0 started")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Очистка при остановке приложения"""
     if redis_client:
         await redis_client.close()
     logger.info("👋 Server shutting down")
@@ -186,7 +217,8 @@ async def stats():
         "active_connections": len(active_connections),
         "online_users": list(active_connections.keys()),
         "offline_queues": offline_counts,
-        "total_offline_messages": sum(offline_counts.values())
+        "total_offline_messages": sum(offline_counts.values()),
+        "registered_keys": len(user_public_keys)
     }
 
 
@@ -211,15 +243,14 @@ async def websocket_endpoint(websocket: WebSocket):
             
             msg_type = data.get("type")
 
-            # === ИНИЦИАЛИЗАЦИЯ ПОДКЛЮЧЕНИЯ ===
+            # === ИНИЦИАЛИЗАЦИЯ ===
             if msg_type == "init":
                 protocol_version = data.get("protocol_version", "1.0")
                 
-                # Проверка версии протокола
                 if protocol_version != PROTOCOL_VERSION:
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": f"Unsupported protocol version. Expected {PROTOCOL_VERSION}, got {protocol_version}"
+                        "message": f"Unsupported protocol version. Expected {PROTOCOL_VERSION}"
                     }))
                     await websocket.close(code=1003)
                     return
@@ -234,11 +265,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
                 
-                # Проверка аутентификации
+                # Аутентификация
                 if provided_token and verify_auth_token(my_uid, provided_token):
                     is_authenticated = True
                 else:
-                    # Генерируем новый токен для нового пользователя
                     new_token = generate_auth_token(my_uid)
                     is_authenticated = True
                     await websocket.send_text(json.dumps({
@@ -247,9 +277,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": "Save this token for future connections"
                     }))
                 
-                # Регистрируем подключение
                 active_connections[my_uid] = websocket
-                logger.info(f"✅ UID {my_uid} connected (authenticated: {is_authenticated})")
+                logger.info(f"✅ UID {my_uid} connected")
                 
                 await websocket.send_text(json.dumps({
                     "type": "uid_assigned",
@@ -267,12 +296,59 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 continue
 
-            # === ПРОВЕРКА АУТЕНТИФИКАЦИИ ДЛЯ ОСТАЛЬНЫХ ОПЕРАЦИЙ ===
+            # === ПРОВЕРКА АУТЕНТИФИКАЦИИ ===
             if not is_authenticated or not my_uid:
                 await websocket.send_text(json.dumps({
                     "type": "error",
                     "message": "Not authenticated"
                 }))
+                continue
+
+            # === РЕГИСТРАЦИЯ ПУБЛИЧНЫХ КЛЮЧЕЙ ===
+            if msg_type == "register_public_key":
+                x25519_key = data.get("x25519_key")
+                ed25519_key = data.get("ed25519_key")
+                
+                if x25519_key:
+                    await save_public_key(my_uid, x25519_key, ed25519_key)
+                    await websocket.send_text(json.dumps({
+                        "type": "public_key_registered",
+                        "uid": my_uid
+                    }))
+                    logger.info(f"🔑 Registered public keys for {my_uid}")
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "x25519_key is required"
+                    }))
+                continue
+
+            # === ЗАПРОС ПУБЛИЧНОГО КЛЮЧА ===
+            if msg_type == "request_public_key":
+                target_uid = data.get("target_uid")
+                
+                if not target_uid:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "target_uid is required"
+                    }))
+                    continue
+                
+                public_keys = await get_public_key(target_uid)
+                
+                if public_keys:
+                    await websocket.send_text(json.dumps({
+                        "type": "public_key_response",
+                        "target_uid": target_uid,
+                        "x25519_key": public_keys.get("x25519"),
+                        "ed25519_key": public_keys.get("ed25519")
+                    }))
+                    logger.info(f"📤 Sent public key of {target_uid} to {my_uid}")
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Public key not found for {target_uid}"
+                    }))
                 continue
 
             # === PING/PONG ===
@@ -335,11 +411,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # === РОУТИНГ СООБЩЕНИЙ ===
             if msg_type == "message":
-                # Rate limiting проверка
                 if is_rate_limited(my_uid):
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": "Rate limit exceeded. Please slow down."
+                        "message": "Rate limit exceeded"
                     }))
                     continue
                 
@@ -353,17 +428,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
                 
-                # Формируем payload для получателя
+                # Формируем payload
                 payload = {
                     "type": "message",
                     "id": message_id,
                     "from_uid": my_uid,
                     "encrypted_payload": data.get("encrypted_payload"),
-                    "fhrg_sig": data.get("fhrg_sig"),
+                    "signature": data.get("signature"),  # Ed25519 подпись
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 
-                # Пытаемся доставить сообщение
+                # Доставка
                 delivered = False
                 if target_uid in active_connections:
                     try:
@@ -374,12 +449,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.error(f"Failed to deliver message: {e}")
                         delivered = False
                 
-                # Если не доставлено, сохраняем офлайн
+                # Офлайн сохранение
                 if not delivered:
                     await save_offline_message(target_uid, payload)
                     logger.info(f"💾 Message {message_id} saved offline {my_uid} -> {target_uid}")
                 
-                # Отправляем ACK отправителю
+                # ACK отправителю
                 await websocket.send_text(json.dumps({
                     "type": "server_ack",
                     "id": message_id,
@@ -388,7 +463,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     "timestamp": datetime.utcnow().isoformat()
                 }))
                 
-                # Отправляем статус "sent"
                 await websocket.send_text(json.dumps({
                     "type": "status_update",
                     "id": message_id,
@@ -397,7 +471,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 continue
             
-            # Неизвестный тип сообщения
+            # Неизвестный тип
             logger.warning(f"Unknown message type '{msg_type}' from {my_uid}")
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -405,11 +479,10 @@ async def websocket_endpoint(websocket: WebSocket):
             }))
 
     except WebSocketDisconnect:
-        logger.info(f"❌ UID {my_uid} disconnected (normal)")
+        logger.info(f"❌ UID {my_uid} disconnected")
     except Exception as e:
-        logger.error(f"❌ Unexpected error for {my_uid}: {e}", exc_info=True)
+        logger.error(f"❌ Error for {my_uid}: {e}", exc_info=True)
     finally:
-        # Очистка подключения
         if my_uid and active_connections.get(my_uid) == websocket:
             del active_connections[my_uid]
             logger.info(f"🔌 Cleaned up connection for {my_uid}")
