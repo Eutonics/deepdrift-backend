@@ -93,9 +93,28 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "init":
                 my_uid = data.get("my_uid")
-                active_connections[my_uid] = websocket
-                logger.info(f"👤 User {my_uid} connected")
+                protocol_version = data.get("protocol_version", "1.0")
                 
+                # ✅ FIX #1: Validate protocol version
+                if protocol_version != "2.0":
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Unsupported protocol version: {protocol_version}. Server requires 2.0"
+                    }))
+                    await websocket.close()
+                    return
+                
+                active_connections[my_uid] = websocket
+                logger.info(f"👤 User {my_uid} connected (protocol v{protocol_version})")
+                
+                # ✅ FIX #2: Send uid_assigned confirmation
+                await websocket.send_text(json.dumps({
+                    "type": "uid_assigned",
+                    "uid": my_uid,
+                    "server_version": "1.0"
+                }))
+                
+                # Retrieve offline messages
                 if redis_client:
                     try:
                         key = f"offline:{my_uid}"
@@ -105,6 +124,67 @@ async def websocket_endpoint(websocket: WebSocket):
                         await redis_client.delete(key)
                     except Exception as e:
                         logger.error(f"Offline retrieval error: {e}")
+                continue
+
+            # ✅ FIX #3: Handle ping-pong for heartbeat
+            if msg_type == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
+            # ✅ FIX #4: Handle public key registration
+            if msg_type == "register_public_key":
+                x25519_key = data.get("x25519_key")
+                ed25519_key = data.get("ed25519_key")
+                
+                if redis_client and my_uid:
+                    try:
+                        await redis_client.set(f"pubkey_x25519:{my_uid}", x25519_key)
+                        await redis_client.set(f"pubkey_ed25519:{my_uid}", ed25519_key)
+                        await websocket.send_text(json.dumps({
+                            "type": "public_key_registered",
+                            "success": True
+                        }))
+                        logger.info(f"🔑 Keys registered for {my_uid}")
+                    except Exception as e:
+                        logger.error(f"Failed to register keys: {e}")
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Failed to register public keys"
+                        }))
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Redis not available for key storage"
+                    }))
+                continue
+
+            # ✅ FIX #5: Handle public key requests
+            if msg_type == "request_public_key":
+                target_uid = data.get("target_uid")
+                
+                if redis_client:
+                    try:
+                        x25519_key = await redis_client.get(f"pubkey_x25519:{target_uid}")
+                        ed25519_key = await redis_client.get(f"pubkey_ed25519:{target_uid}")
+                        
+                        await websocket.send_text(json.dumps({
+                            "type": "public_key_response",
+                            "target_uid": target_uid,
+                            "x25519_key": x25519_key,
+                            "ed25519_key": ed25519_key
+                        }))
+                        logger.info(f"🔑 Sent keys for {target_uid} to {my_uid}")
+                    except Exception as e:
+                        logger.error(f"Failed to retrieve keys: {e}")
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": f"Failed to retrieve keys for {target_uid}"
+                        }))
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Redis not available"
+                    }))
                 continue
 
             if msg_type == "message":
@@ -148,6 +228,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         if my_uid in active_connections: del active_connections[my_uid]
+        logger.info(f"👋 User {my_uid} disconnected")
     except Exception as e:
         logger.error(f"WS Runtime error: {e}")
     finally:
