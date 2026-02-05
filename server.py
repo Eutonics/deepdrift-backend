@@ -8,16 +8,24 @@ from typing import Dict, Optional
 import redis.asyncio as redis
 import httpx
 
-# Логирование
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("DDChatRelay")
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- ЧИТАЕМ REDIS_URL ИЗ ПАНЕЛИ RENDER ---
-# Если переменная не найдена, сервер не упадет, а просто выключит оффлайн-режим
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Берем URL из Environment Variables Render
 REDIS_URL = os.environ.get("REDIS_URL")
+FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY", "YOUR_FCM_KEY")
+
 redis_client: Optional[redis.Redis] = None
 active_connections: Dict[str, WebSocket] = {}
 
@@ -26,24 +34,52 @@ async def startup_event():
     global redis_client
     if REDIS_URL:
         try:
-            # Убираем возможные проблемы с протоколом redis/rediss
-            url = REDIS_URL.replace("cache://", "redis://")
-            redis_client = await redis.from_url(url, encoding="utf-8", decode_responses=True)
+            # Render иногда дает префикс rediss:// для защищенного соединения
+            redis_client = await redis.from_url(
+                REDIS_URL, 
+                encoding="utf-8", 
+                decode_responses=True,
+                ssl_cert_reqs=None # Игнорируем проверку сертификата для стабильности
+            )
             await redis_client.ping()
-            logger.info("✅ Connected to Render Redis")
+            logger.info("✅ Redis connected successfully")
         except Exception as e:
-            logger.error(f"❌ Redis Connection Error: {e}")
+            logger.error(f"❌ Redis connection failed: {e}")
             redis_client = None
     else:
-        logger.warning("⚠️ REDIS_URL not found in environment variables")
+        logger.warning("⚠️ REDIS_URL not found")
 
 @app.get("/")
 async def root():
     return {
         "status": "online",
         "redis_active": redis_client is not None,
-        "connections": len(active_connections)
+        "active_users": len(active_connections)
     }
+
+async def send_fcm_push(target_uid: str, sender_name: str):
+    if not redis_client or not FCM_SERVER_KEY: return
+    try:
+        token = await redis_client.get(f"fcm_token:{target_uid}")
+        if not token: return
+        
+        headers = {
+            'Authorization': f'key={FCM_SERVER_KEY}',
+            'Content-Type': 'application/json',
+        }
+        payload = {
+            'to': token,
+            'notification': {
+                'title': f'DeepDrift: {sender_name}',
+                'body': 'New encrypted message',
+                'sound': 'default',
+            },
+            'priority': 'high'
+        }
+        async with httpx.AsyncClient() as client:
+            await client.post('https://fcm.googleapis.com/fcm/send', headers=headers, json=payload)
+    except Exception as e:
+        logger.error(f"Push error: {e}")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -64,30 +100,40 @@ async def websocket_endpoint(websocket: WebSocket):
                     try:
                         key = f"offline:{my_uid}"
                         msgs = await redis_client.lrange(key, 0, -1)
-                        for m in reversed(msgs): await websocket.send_text(m)
+                        for m in reversed(msgs):
+                            await websocket.send_text(m)
                         await redis_client.delete(key)
-                    except: pass
+                    except Exception as e:
+                        logger.error(f"Offline retrieval error: {e}")
                 continue
 
             if msg_type == "message":
                 target_uid = data.get("target_uid")
+                msg_id = data.get("id")
                 payload = {
                     "type": "message",
-                    "id": data.get("id"),
+                    "id": msg_id,
                     "from_uid": my_uid,
                     "encrypted_payload": data.get("encrypted_payload"),
                     "signature": data.get("signature"),
                     "timestamp": datetime.utcnow().isoformat()
                 }
+
                 if target_uid in active_connections:
                     await active_connections[target_uid].send_text(json.dumps(payload))
-                    await websocket.send_text(json.dumps({"type": "status_update", "id": data.get("id"), "status": "delivered"}))
+                    await websocket.send_text(json.dumps({
+                        "type": "status_update", "id": msg_id, "status": "delivered"
+                    }))
                 else:
                     if redis_client:
-                        try: await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
-                        except: pass
-                    # Push уведомление (если настроен ключ)
-                    await websocket.send_text(json.dumps({"type": "status_update", "id": data.get("id"), "status": "sent"}))
+                        try:
+                            await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
+                        except Exception as e:
+                            logger.error(f"Offline save error: {e}")
+                    await send_fcm_push(target_uid, my_uid[:8] if my_uid else "User")
+                    await websocket.send_text(json.dumps({
+                        "type": "status_update", "id": msg_id, "status": "sent"
+                    }))
 
             if msg_type in ["typing", "read_receipt", "delivery_receipt"]:
                 target = data.get("target_uid")
@@ -95,8 +141,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     data["from_uid"] = my_uid
                     await active_connections[target].send_text(json.dumps(data))
 
-    except Exception:
-        pass
+            if msg_type == "register_fcm_token":
+                token = data.get("fcm_token")
+                if redis_client and my_uid:
+                    await redis_client.set(f"fcm_token:{my_uid}", token)
+
+    except WebSocketDisconnect:
+        if my_uid in active_connections: del active_connections[my_uid]
+    except Exception as e:
+        logger.error(f"WS Runtime error: {e}")
     finally:
-        if my_uid in active_connections:
-            del active_connections[my_uid]
+        if my_uid in active_connections: del active_connections[my_uid]
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000)
