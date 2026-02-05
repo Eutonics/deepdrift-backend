@@ -29,6 +29,13 @@ FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY", "YOUR_FCM_KEY")
 redis_client: Optional[redis.Redis] = None
 active_connections: Dict[str, WebSocket] = {}
 
+# ✅ In-memory storage для работы без Redis (для тестирования)
+in_memory_storage = {
+    "pubkeys": {},      # {uid: {"x25519": "...", "ed25519": "..."}}
+    "offline": {},      # {uid: [messages]}
+    "fcm_tokens": {}    # {uid: "token"}
+}
+
 @app.on_event("startup")
 async def startup_event():
     global redis_client
@@ -39,28 +46,36 @@ async def startup_event():
                 REDIS_URL, 
                 encoding="utf-8", 
                 decode_responses=True,
-                ssl_cert_reqs=None # Игнорируем проверку сертификата для стабильности
+                ssl_cert_reqs=None
             )
             await redis_client.ping()
             logger.info("✅ Redis connected successfully")
         except Exception as e:
             logger.error(f"❌ Redis connection failed: {e}")
+            logger.warning("⚠️ Falling back to in-memory storage")
             redis_client = None
     else:
-        logger.warning("⚠️ REDIS_URL not found")
+        logger.warning("⚠️ REDIS_URL not found, using in-memory storage")
 
 @app.get("/")
 async def root():
     return {
         "status": "online",
         "redis_active": redis_client is not None,
-        "active_users": len(active_connections)
+        "active_users": len(active_connections),
+        "storage_mode": "redis" if redis_client else "in-memory"
     }
 
 async def send_fcm_push(target_uid: str, sender_name: str):
-    if not redis_client or not FCM_SERVER_KEY: return
+    if not FCM_SERVER_KEY: return
     try:
-        token = await redis_client.get(f"fcm_token:{target_uid}")
+        # Попытка получить токен из Redis или памяти
+        token = None
+        if redis_client:
+            token = await redis_client.get(f"fcm_token:{target_uid}")
+        else:
+            token = in_memory_storage["fcm_tokens"].get(target_uid)
+            
         if not token: return
         
         headers = {
@@ -90,13 +105,16 @@ async def websocket_endpoint(websocket: WebSocket):
             raw = await websocket.receive_text()
             data = json.loads(raw)
             msg_type = data.get("type")
+            
+            logger.info(f"📨 Received: {msg_type} from {my_uid or 'unknown'}")
 
             if msg_type == "init":
                 my_uid = data.get("my_uid")
                 protocol_version = data.get("protocol_version", "1.0")
                 
-                # ✅ FIX #1: Validate protocol version
+                # Validate protocol version
                 if protocol_version != "2.0":
+                    logger.warning(f"⚠️ Unsupported protocol version: {protocol_version}")
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": f"Unsupported protocol version: {protocol_version}. Server requires 2.0"
@@ -107,7 +125,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 active_connections[my_uid] = websocket
                 logger.info(f"👤 User {my_uid} connected (protocol v{protocol_version})")
                 
-                # ✅ FIX #2: Send uid_assigned confirmation
+                # Send uid_assigned confirmation
                 await websocket.send_text(json.dumps({
                     "type": "uid_assigned",
                     "uid": my_uid,
@@ -115,75 +133,89 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
                 
                 # Retrieve offline messages
-                if redis_client:
-                    try:
+                try:
+                    if redis_client:
                         key = f"offline:{my_uid}"
                         msgs = await redis_client.lrange(key, 0, -1)
                         for m in reversed(msgs):
                             await websocket.send_text(m)
                         await redis_client.delete(key)
-                    except Exception as e:
-                        logger.error(f"Offline retrieval error: {e}")
+                    else:
+                        # Use in-memory storage
+                        if my_uid in in_memory_storage["offline"]:
+                            for m in reversed(in_memory_storage["offline"][my_uid]):
+                                await websocket.send_text(m)
+                            in_memory_storage["offline"][my_uid] = []
+                except Exception as e:
+                    logger.error(f"Offline retrieval error: {e}")
                 continue
 
-            # ✅ FIX #3: Handle ping-pong for heartbeat
             if msg_type == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
-            # ✅ FIX #4: Handle public key registration
             if msg_type == "register_public_key":
                 x25519_key = data.get("x25519_key")
                 ed25519_key = data.get("ed25519_key")
                 
-                if redis_client and my_uid:
-                    try:
+                if not my_uid:
+                    logger.error("❌ No UID set, cannot register keys")
+                    continue
+                
+                try:
+                    if redis_client:
+                        # Use Redis
                         await redis_client.set(f"pubkey_x25519:{my_uid}", x25519_key)
                         await redis_client.set(f"pubkey_ed25519:{my_uid}", ed25519_key)
-                        await websocket.send_text(json.dumps({
-                            "type": "public_key_registered",
-                            "success": True
-                        }))
-                        logger.info(f"🔑 Keys registered for {my_uid}")
-                    except Exception as e:
-                        logger.error(f"Failed to register keys: {e}")
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": "Failed to register public keys"
-                        }))
-                else:
+                    else:
+                        # Use in-memory storage
+                        in_memory_storage["pubkeys"][my_uid] = {
+                            "x25519": x25519_key,
+                            "ed25519": ed25519_key
+                        }
+                    
+                    await websocket.send_text(json.dumps({
+                        "type": "public_key_registered",
+                        "success": True
+                    }))
+                    logger.info(f"🔑 Keys registered for {my_uid}")
+                except Exception as e:
+                    logger.error(f"Failed to register keys: {e}")
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": "Redis not available for key storage"
+                        "message": f"Failed to register public keys: {str(e)}"
                     }))
                 continue
 
-            # ✅ FIX #5: Handle public key requests
             if msg_type == "request_public_key":
                 target_uid = data.get("target_uid")
                 
-                if redis_client:
-                    try:
+                try:
+                    x25519_key = None
+                    ed25519_key = None
+                    
+                    if redis_client:
+                        # Use Redis
                         x25519_key = await redis_client.get(f"pubkey_x25519:{target_uid}")
                         ed25519_key = await redis_client.get(f"pubkey_ed25519:{target_uid}")
-                        
-                        await websocket.send_text(json.dumps({
-                            "type": "public_key_response",
-                            "target_uid": target_uid,
-                            "x25519_key": x25519_key,
-                            "ed25519_key": ed25519_key
-                        }))
-                        logger.info(f"🔑 Sent keys for {target_uid} to {my_uid}")
-                    except Exception as e:
-                        logger.error(f"Failed to retrieve keys: {e}")
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": f"Failed to retrieve keys for {target_uid}"
-                        }))
-                else:
+                    else:
+                        # Use in-memory storage
+                        if target_uid in in_memory_storage["pubkeys"]:
+                            x25519_key = in_memory_storage["pubkeys"][target_uid]["x25519"]
+                            ed25519_key = in_memory_storage["pubkeys"][target_uid]["ed25519"]
+                    
+                    await websocket.send_text(json.dumps({
+                        "type": "public_key_response",
+                        "target_uid": target_uid,
+                        "x25519_key": x25519_key,
+                        "ed25519_key": ed25519_key
+                    }))
+                    logger.info(f"🔑 Sent keys for {target_uid} to {my_uid}")
+                except Exception as e:
+                    logger.error(f"Failed to retrieve keys: {e}")
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": "Redis not available"
+                        "message": f"Failed to retrieve keys for {target_uid}: {str(e)}"
                     }))
                 continue
 
@@ -205,11 +237,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "status_update", "id": msg_id, "status": "delivered"
                     }))
                 else:
-                    if redis_client:
-                        try:
+                    # Save offline message
+                    try:
+                        if redis_client:
                             await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
-                        except Exception as e:
-                            logger.error(f"Offline save error: {e}")
+                        else:
+                            if target_uid not in in_memory_storage["offline"]:
+                                in_memory_storage["offline"][target_uid] = []
+                            in_memory_storage["offline"][target_uid].append(json.dumps(payload))
+                    except Exception as e:
+                        logger.error(f"Offline save error: {e}")
+                        
                     await send_fcm_push(target_uid, my_uid[:8] if my_uid else "User")
                     await websocket.send_text(json.dumps({
                         "type": "status_update", "id": msg_id, "status": "sent"
@@ -223,16 +261,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "register_fcm_token":
                 token = data.get("fcm_token")
-                if redis_client and my_uid:
-                    await redis_client.set(f"fcm_token:{my_uid}", token)
+                if my_uid:
+                    try:
+                        if redis_client:
+                            await redis_client.set(f"fcm_token:{my_uid}", token)
+                        else:
+                            in_memory_storage["fcm_tokens"][my_uid] = token
+                    except Exception as e:
+                        logger.error(f"Failed to save FCM token: {e}")
 
     except WebSocketDisconnect:
-        if my_uid in active_connections: del active_connections[my_uid]
+        if my_uid and my_uid in active_connections:
+            del active_connections[my_uid]
         logger.info(f"👋 User {my_uid} disconnected")
     except Exception as e:
-        logger.error(f"WS Runtime error: {e}")
+        logger.error(f"❌ WS Runtime error: {e}", exc_info=True)  # ✅ Added exc_info for full stack trace
+        if my_uid and my_uid in active_connections:
+            del active_connections[my_uid]
     finally:
-        if my_uid in active_connections: del active_connections[my_uid]
+        if my_uid and my_uid in active_connections:
+            del active_connections[my_uid]
 
 if __name__ == "__main__":
     import uvicorn
