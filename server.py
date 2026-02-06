@@ -161,7 +161,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if redis_client and target_uid:
                     try:
-                        # Получаем ключи из Redis
+                        # Получаем ключи запрашиваемого пользователя из Redis
                         x25519_key = await redis_client.get(f"pubkey:{target_uid}:x25519")
                         ed25519_key = await redis_client.get(f"pubkey:{target_uid}:ed25519")
                         
@@ -175,6 +175,28 @@ async def websocket_endpoint(websocket: WebSocket):
                             }
                             await websocket.send_text(json.dumps(response))
                             logger.info(f"🔑 Sent public keys of {target_uid} to {my_uid}")
+                            
+                            # НОВОЕ: Автоматический взаимный обмен ключами
+                            # Если запрашиваемый пользователь онлайн, отправляем ему ключи запросившего
+                            if target_uid in active_connections and my_uid:
+                                # Получаем ключи запросившего пользователя
+                                my_x25519 = await redis_client.get(f"pubkey:{my_uid}:x25519")
+                                my_ed25519 = await redis_client.get(f"pubkey:{my_uid}:ed25519")
+                                
+                                if my_x25519 and my_ed25519:
+                                    reverse_response = {
+                                        "type": "public_key_response",
+                                        "target_uid": my_uid,
+                                        "x25519_key": my_x25519,
+                                        "ed25519_key": my_ed25519
+                                    }
+                                    try:
+                                        await active_connections[target_uid].send_text(
+                                            json.dumps(reverse_response)
+                                        )
+                                        logger.info(f"🔄 Auto-sent public keys of {my_uid} to {target_uid}")
+                                    except Exception as e:
+                                        logger.error(f"❌ Failed to auto-send keys to {target_uid}: {e}")
                         else:
                             # Ключи не найдены
                             await websocket.send_text(json.dumps({
