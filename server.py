@@ -13,7 +13,7 @@ from firebase_admin import credentials, messaging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("DDChatRelay")
 
-app = FastAPI(title="DeepDrift Secure Relay", version="3.1.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="3.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Параметры из Render
@@ -103,19 +103,23 @@ async def websocket_endpoint(websocket: WebSocket):
             data = json.loads(raw)
             msg_type = data.get("type")
 
+            # === ИНИЦИАЛИЗАЦИЯ ПОДКЛЮЧЕНИЯ ===
             if msg_type == "init":
                 my_uid = data.get("my_uid")
                 active_connections[my_uid] = websocket
                 logger.info(f"👤 {my_uid} connected")
                 await websocket.send_text(json.dumps({"type": "uid_assigned", "uid": my_uid}))
                 
+                # Отправляем оффлайн сообщения
                 if redis_client:
                     key = f"offline:{my_uid}"
                     msgs = await redis_client.lrange(key, 0, -1)
-                    for m in reversed(msgs): await websocket.send_text(m)
+                    for m in reversed(msgs): 
+                        await websocket.send_text(m)
                     await redis_client.delete(key)
                 continue
 
+            # === РЕГИСТРАЦИЯ FCM ТОКЕНА ===
             if msg_type == "register_fcm_token":
                 token = data.get("fcm_token")
                 if redis_client and my_uid:
@@ -123,35 +127,142 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"📱 Token registered for {my_uid}")
                 continue
 
+            # === РЕГИСТРАЦИЯ ПУБЛИЧНЫХ КЛЮЧЕЙ ===
+            if msg_type == "register_public_key":
+                x25519_key = data.get("x25519_key")
+                ed25519_key = data.get("ed25519_key")
+                
+                if redis_client and my_uid and x25519_key and ed25519_key:
+                    # Сохраняем ключи в Redis с TTL 30 дней
+                    await redis_client.setex(
+                        f"pubkey:{my_uid}:x25519",
+                        30 * 24 * 3600,
+                        x25519_key
+                    )
+                    await redis_client.setex(
+                        f"pubkey:{my_uid}:ed25519",
+                        30 * 24 * 3600,
+                        ed25519_key
+                    )
+                    logger.info(f"🔑 Public keys registered for {my_uid}")
+                    
+                    # Подтверждаем регистрацию
+                    await websocket.send_text(json.dumps({
+                        "type": "public_key_registered",
+                        "status": "success"
+                    }))
+                else:
+                    logger.warning(f"⚠️ Failed to register keys for {my_uid}")
+                continue
+
+            # === ЗАПРОС ПУБЛИЧНЫХ КЛЮЧЕЙ ===
+            if msg_type == "request_public_key":
+                target_uid = data.get("target_uid")
+                
+                if redis_client and target_uid:
+                    try:
+                        # Получаем ключи из Redis
+                        x25519_key = await redis_client.get(f"pubkey:{target_uid}:x25519")
+                        ed25519_key = await redis_client.get(f"pubkey:{target_uid}:ed25519")
+                        
+                        if x25519_key and ed25519_key:
+                            # Отправляем ключи запросившему
+                            response = {
+                                "type": "public_key_response",
+                                "target_uid": target_uid,
+                                "x25519_key": x25519_key,
+                                "ed25519_key": ed25519_key
+                            }
+                            await websocket.send_text(json.dumps(response))
+                            logger.info(f"🔑 Sent public keys of {target_uid} to {my_uid}")
+                        else:
+                            # Ключи не найдены
+                            await websocket.send_text(json.dumps({
+                                "type": "public_key_response",
+                                "target_uid": target_uid,
+                                "error": "keys_not_found"
+                            }))
+                            logger.warning(f"⚠️ Public keys not found for {target_uid}")
+                    except Exception as e:
+                        logger.error(f"❌ Error retrieving keys for {target_uid}: {e}")
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": f"Failed to retrieve keys: {str(e)}"
+                        }))
+                continue
+
+            # === ОТПРАВКА СООБЩЕНИЯ ===
             if msg_type == "message":
                 target_uid = data.get("target_uid")
                 msg_id = data.get("id")
                 payload = {
-                    "type": "message", "id": msg_id, "from_uid": my_uid,
+                    "type": "message", 
+                    "id": msg_id, 
+                    "from_uid": my_uid,
                     "encrypted_payload": data.get("encrypted_payload"),
                     "signature": data.get("signature"),
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 
+                # Проверяем, онлайн ли получатель
                 if target_uid in active_connections:
-                    await active_connections[target_uid].send_text(json.dumps(payload))
-                    await websocket.send_text(json.dumps({"type": "status_update", "id": msg_id, "status": "delivered"}))
+                    try:
+                        await active_connections[target_uid].send_text(json.dumps(payload))
+                        await websocket.send_text(json.dumps({
+                            "type": "status_update", 
+                            "id": msg_id, 
+                            "status": "delivered"
+                        }))
+                        logger.info(f"📨 Message {msg_id} delivered to {target_uid}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
+                        # Сохраняем в оффлайн очередь
+                        if redis_client:
+                            await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
+                        await websocket.send_text(json.dumps({
+                            "type": "status_update", 
+                            "id": msg_id, 
+                            "status": "sent"
+                        }))
                 else:
+                    # Получатель оффлайн - сохраняем в Redis
                     if redis_client:
                         await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
+                        logger.info(f"💾 Message {msg_id} saved for offline {target_uid}")
+                    
+                    # Отправляем push-уведомление
                     await send_fcm_push(target_uid, my_uid or "User")
-                    await websocket.send_text(json.dumps({"type": "status_update", "id": msg_id, "status": "sent"}))
+                    
+                    await websocket.send_text(json.dumps({
+                        "type": "status_update", 
+                        "id": msg_id, 
+                        "status": "sent"
+                    }))
                 continue
 
+            # === ИНДИКАТОРЫ НАБОРА ТЕКСТА И ПРОЧТЕНИЯ ===
             if msg_type in ["typing", "read_receipt", "delivery_receipt"]:
                 target = data.get("target_uid")
                 if target in active_connections:
                     data["from_uid"] = my_uid
-                    await active_connections[target].send_text(json.dumps(data))
+                    try:
+                        await active_connections[target].send_text(json.dumps(data))
+                        logger.debug(f"📤 {msg_type} sent to {target}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to send {msg_type} to {target}: {e}")
+                continue
 
-    except Exception: pass
+            # Неизвестный тип сообщения
+            logger.warning(f"⚠️ Unknown message type: {msg_type} from {my_uid}")
+
+    except WebSocketDisconnect:
+        logger.info(f"👋 {my_uid} disconnected normally")
+    except Exception as e:
+        logger.error(f"❌ WebSocket error for {my_uid}: {e}")
     finally:
-        if my_uid in active_connections: del active_connections[my_uid]
+        if my_uid in active_connections: 
+            del active_connections[my_uid]
+            logger.info(f"🧹 Cleaned up connection for {my_uid}")
 
 if __name__ == "__main__":
     import uvicorn
