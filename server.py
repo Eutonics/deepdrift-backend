@@ -13,7 +13,7 @@ from firebase_admin import credentials, messaging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("DDChatRelay")
 
-app = FastAPI(title="DeepDrift Secure Relay", version="3.2.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="3.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Параметры из Render
@@ -70,6 +70,7 @@ async def startup_event():
 async def root():
     return {
         "status": "ONLINE",
+        "version": "3.3.0",
         "firebase": "active" if firebase_admin._apps else "error",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections)
