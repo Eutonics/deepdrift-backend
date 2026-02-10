@@ -13,7 +13,7 @@ from firebase_admin import credentials, messaging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("DDChatRelay")
 
-app = FastAPI(title="DeepDrift Secure Relay", version="3.3.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="3.3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Параметры из Render
@@ -43,10 +43,8 @@ async def init_redis():
         return
 
     try:
-        # Хак для Render: заменяем cache:// на redis:// и отключаем проверку SSL если нужно
         url = REDIS_URL.replace("cache://", "redis://")
         
-        # Создаем клиент с настройками для облачных БД
         redis_client = redis.from_url(
             url, 
             encoding="utf-8", 
@@ -55,7 +53,6 @@ async def init_redis():
             retry_on_timeout=True
         )
         
-        # Проверяем связь
         await redis_client.ping()
         logger.info("✅ Redis connected successfully!")
     except Exception as e:
@@ -70,7 +67,7 @@ async def startup_event():
 async def root():
     return {
         "status": "ONLINE",
-        "version": "3.3.0",
+        "version": "3.3.1",
         "firebase": "active" if firebase_admin._apps else "error",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections)
@@ -87,12 +84,51 @@ async def send_fcm_push(target_uid: str, from_uid: str):
                 title=f"DeepDrift: {from_uid[:8]}",
                 body="Новое зашифрованное сообщение",
             ),
+            data={
+                "from_uid": from_uid,
+                "type": "new_message",
+            },
             token=token,
         )
         messaging.send(message)
         logger.info(f"📲 Push sent to {target_uid}")
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
+
+# НОВОЕ: Асинхронная отправка оффлайн сообщений с задержкой
+async def send_offline_messages(websocket: WebSocket, my_uid: str):
+    """
+    Отправляет оффлайн сообщения с небольшой задержкой,
+    чтобы дать клиенту время зарегистрировать ключи
+    """
+    import asyncio
+    
+    # Ждём 500ms чтобы клиент успел зарегистрировать FCM токен и публичные ключи
+    await asyncio.sleep(0.5)
+    
+    if not redis_client:
+        return
+    
+    try:
+        key = f"offline:{my_uid}"
+        msgs = await redis_client.lrange(key, 0, -1)
+        
+        if msgs:
+            logger.info(f"📬 Sending {len(msgs)} offline messages to {my_uid}")
+            
+            for m in reversed(msgs):
+                try:
+                    await websocket.send_text(m)
+                    logger.info(f"📤 Sent offline message to {my_uid}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to send offline message: {e}")
+                    return  # Останавливаемся если соединение оборвалось
+            
+            # Очищаем очередь только если все сообщения отправлены успешно
+            await redis_client.delete(key)
+            logger.info(f"✅ Cleared offline queue for {my_uid}")
+    except Exception as e:
+        logger.error(f"❌ Error sending offline messages: {e}")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -111,13 +147,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info(f"👤 {my_uid} connected")
                 await websocket.send_text(json.dumps({"type": "uid_assigned", "uid": my_uid}))
                 
-                # Отправляем оффлайн сообщения
-                if redis_client:
-                    key = f"offline:{my_uid}"
-                    msgs = await redis_client.lrange(key, 0, -1)
-                    for m in reversed(msgs): 
-                        await websocket.send_text(m)
-                    await redis_client.delete(key)
+                # ИСПРАВЛЕНИЕ: Отправляем оффлайн сообщения асинхронно с задержкой
+                # Это даёт клиенту время зарегистрировать FCM токен и ключи
+                import asyncio
+                asyncio.create_task(send_offline_messages(websocket, my_uid))
+                
                 continue
 
             # === РЕГИСТРАЦИЯ FCM ТОКЕНА ===
@@ -126,6 +160,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 if redis_client and my_uid:
                     await redis_client.set(f"fcm_token:{my_uid}", token)
                     logger.info(f"📱 Token registered for {my_uid}")
+                    await websocket.send_text(json.dumps({
+                        "type": "fcm_token_registered",
+                        "status": "success"
+                    }))
                 continue
 
             # === РЕГИСТРАЦИЯ ПУБЛИЧНЫХ КЛЮЧЕЙ ===
@@ -134,7 +172,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 ed25519_key = data.get("ed25519_key")
                 
                 if redis_client and my_uid and x25519_key and ed25519_key:
-                    # Сохраняем ключи в Redis с TTL 30 дней
                     await redis_client.setex(
                         f"pubkey:{my_uid}:x25519",
                         30 * 24 * 3600,
@@ -147,7 +184,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     logger.info(f"🔑 Public keys registered for {my_uid}")
                     
-                    # Подтверждаем регистрацию
                     await websocket.send_text(json.dumps({
                         "type": "public_key_registered",
                         "status": "success"
@@ -162,12 +198,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if redis_client and target_uid:
                     try:
-                        # Получаем ключи запрашиваемого пользователя из Redis
                         x25519_key = await redis_client.get(f"pubkey:{target_uid}:x25519")
                         ed25519_key = await redis_client.get(f"pubkey:{target_uid}:ed25519")
                         
                         if x25519_key and ed25519_key:
-                            # Отправляем ключи запросившему
                             response = {
                                 "type": "public_key_response",
                                 "target_uid": target_uid,
@@ -177,10 +211,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_text(json.dumps(response))
                             logger.info(f"🔑 Sent public keys of {target_uid} to {my_uid}")
                             
-                            # НОВОЕ: Автоматический взаимный обмен ключами
-                            # Если запрашиваемый пользователь онлайн, отправляем ему ключи запросившего
+                            # Автоматический взаимный обмен ключами
                             if target_uid in active_connections and my_uid:
-                                # Получаем ключи запросившего пользователя
                                 my_x25519 = await redis_client.get(f"pubkey:{my_uid}:x25519")
                                 my_ed25519 = await redis_client.get(f"pubkey:{my_uid}:ed25519")
                                 
@@ -199,7 +231,6 @@ async def websocket_endpoint(websocket: WebSocket):
                                     except Exception as e:
                                         logger.error(f"❌ Failed to auto-send keys to {target_uid}: {e}")
                         else:
-                            # Ключи не найдены
                             await websocket.send_text(json.dumps({
                                 "type": "public_key_response",
                                 "target_uid": target_uid,
@@ -239,7 +270,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info(f"📨 Message {msg_id} delivered to {target_uid}")
                     except Exception as e:
                         logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
-                        # Сохраняем в оффлайн очередь
                         if redis_client:
                             await redis_client.lpush(f"offline:{target_uid}", json.dumps(payload))
                         await websocket.send_text(json.dumps({
@@ -261,6 +291,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         "id": msg_id, 
                         "status": "sent"
                     }))
+                continue
+
+            # === PING/PONG для heartbeat ===
+            if msg_type == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
             # === ИНДИКАТОРЫ НАБОРА ТЕКСТА И ПРОЧТЕНИЯ ===
