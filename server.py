@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="4.2.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="4.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
@@ -104,11 +104,13 @@ def _clean_rate_limit(uid: str):
 
 
 async def _send_to(ws: WebSocket, payload: dict):
-    """Безопасная отправка JSON клиенту."""
+    """Безопасная отправка JSON клиенту (для текущего соединения)."""
     try:
         await ws.send_text(json.dumps(payload))
     except Exception as e:
         logger.error(f"❌ send_to error: {e}")
+        # Если не удалось отправить в текущий сокет, скорее всего он мертв
+        # Исключение всплывет выше в основном цикле
 
 
 async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message"):
@@ -140,7 +142,15 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
             ),
             data={"from_uid": from_uid, "type": message_type},
             token=token,
+            # Важные настройки для Android/iOS чтобы пуш приходил сразу
+            android=messaging.AndroidConfig(priority='high'),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(content_available=True)
+                )
+            )
         )
+        
         # Запускаем синхронный вызов в thread pool
         await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
         logger.info(f"📲 Push sent to {target_uid} ({message_type})")
@@ -170,7 +180,7 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
         logger.error(f"❌ Error sending offline messages: {e}")
 
 
-# ─── Оффлайн сообщения (Specific Sender) - NEW ──────────────────────────────
+# ─── Оффлайн сообщения (Specific Sender) ────────────────────────────────────
 async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_uid: str):
     """Доставка оффлайн-сообщений от конкретного отправителя."""
     if not redis_client:
@@ -215,22 +225,41 @@ async def _store_offline_message(target_uid: str, message_data: dict):
         await redis_client.rpush(offline_key_specific, json.dumps(message_data))
         await redis_client.expire(offline_key_specific, 7 * 24 * 3600)
         
-        logger.info(f"💾 Stored offline message for {target_uid} from {from_uid} (Dual storage)")
+        logger.info(f"💾 Stored offline message for {target_uid} from {from_uid}")
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
 
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str):
-    """Доставить сообщение онлайн, либо сохранить оффлайн и отправить push."""
+    """
+    Пытается доставить сообщение онлайн. 
+    Если не выходит (ошибка сокета) — СРАЗУ удаляет сокет и сохраняет в оффлайн + пуш.
+    """
+    
+    # 1. Попытка онлайн доставки
     if target_uid in active_connections:
+        ws = active_connections[target_uid]
         try:
-            await active_connections[target_uid].send_text(json.dumps(payload))
-            return True
+            await ws.send_text(json.dumps(payload))
+            return True  # Успешно доставлено онлайн
         except Exception as e:
             logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
+            
+            # 🔥 CRITICAL FIX: Если отправка не удалась, значит сокет мертв.
+            # Удаляем его НЕМЕДЛЕННО, чтобы не пытаться слать туда снова
+            # и чтобы следующие сообщения сразу шли в оффлайн/пуш.
+            logger.warning(f"🔌 Removing dead connection for {target_uid}")
+            if target_uid in active_connections:
+                del active_connections[target_uid]
+            
+            # Пропускаем flow дальше к сохранению в оффлайн
+    
+    # 2. Если пользователя нет в active_connections ИЛИ отправка упала с ошибкой:
+    logger.info(f"💤 User {target_uid} is offline/unreachable. Storing & Pushing.")
     
     await _store_offline_message(target_uid, payload)
     await _send_fcm_push(target_uid, from_uid, push_type)
+    
     return False
 
 
@@ -240,17 +269,10 @@ async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from
 async def root():
     return {
         "status": "ONLINE",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "firebase": "active" if firebase_admin._apps else "error/disabled",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections),
-        "features": [
-            "dual_offline_storage", "request_offline_messages",
-            "delete_message", "edit_message", "message_reaction",
-            "forward_message", "read_receipt", "delivery_receipt",
-            "voice_messages", "photo_messages", "file_transfer",
-            "server_ack", "rate_limiting",
-        ],
     }
 
 
@@ -279,6 +301,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 my_uid = uid_candidate
+                
+                # Принудительно обновляем соединение
                 active_connections[my_uid] = websocket
                 logger.info(f"✅ {my_uid} connected (total: {len(active_connections)})")
 
@@ -299,10 +323,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
-            # ── NEW: REQUEST OFFLINE MESSAGES ─────────────────────────────
+            # ── REQUEST OFFLINE MESSAGES ──────────────────────────────────
             if msg_type == "request_offline_messages":
-                # Клиент отправляет 'target_uid' (с кем чатится), 
-                # для сервера это 'from_uid' (от кого достать сообщения)
                 target_from_uid = data.get("target_uid") or data.get("from_uid")
                 
                 if not target_from_uid:
@@ -465,11 +487,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "action":     action,
                     "time":       _now_ms(),
                 }
-                if target_uid in active_connections:
-                    await _send_to(active_connections[target_uid], payload)
-                    logger.info(f"{emoji} Reaction delivered: {emoji} on {message_id}")
-                else:
-                    await _send_fcm_push(target_uid, my_uid, "message_reaction")
+                # Реакции тоже нужно прогонять через механизм гарантированной доставки
+                await _deliver_or_store(target_uid, payload, "message_reaction", my_uid)
+                logger.info(f"{emoji} Reaction handled: {emoji} on {message_id}")
                 continue
 
             # ── FORWARD MESSAGE ───────────────────────────────────────────
@@ -494,12 +514,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     "forwarded_from":      forwarded_from,
                     "original_message_id": original_message_id,
                 }
-                await _deliver_or_store(target_uid, payload, "new_message", my_uid)
+                delivered = await _deliver_or_store(target_uid, payload, "new_message", my_uid)
 
                 await _send_to(websocket, {
                     "type":             "server_ack",
                     "id":               new_message_id,
-                    "delivered_online": target_uid in active_connections,
+                    "delivered_online": delivered,
                 })
                 logger.info(f"↪️ Forward delivered: {new_message_id}")
                 continue
@@ -519,8 +539,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "time":       _now_ms(),
                 }
                 if target_uid in active_connections:
-                    await _send_to(active_connections[target_uid], payload)
-                    logger.info(f"✓✓ Read receipt delivered: {message_id}")
+                     await _send_to(active_connections[target_uid], payload)
+                     logger.info(f"✓✓ Read receipt delivered: {message_id}")
                 continue
 
             # ── DELIVERY RECEIPT ──────────────────────────────────────────
@@ -564,11 +584,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         if my_uid:
-            active_connections.pop(my_uid, None)
-            _clean_rate_limit(my_uid) # Очистка памяти
-            logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
+            # Проверяем, действительно ли это тот же сокет, что в active_connections
+            if my_uid in active_connections and active_connections[my_uid] == websocket:
+                active_connections.pop(my_uid, None)
+                logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
+            _clean_rate_limit(my_uid)
     except Exception as e:
-        logger.error(f"❌ WebSocket error: {e}")
-        if my_uid:
+        logger.error(f"❌ WebSocket loop error: {e}")
+        if my_uid and my_uid in active_connections and active_connections[my_uid] == websocket:
             active_connections.pop(my_uid, None)
             _clean_rate_limit(my_uid)
