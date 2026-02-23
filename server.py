@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="4.1.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ try:
         firebase_admin.initialize_app(cred)
         logger.info("✅ Firebase Admin SDK initialized")
     else:
-        logger.error("❌ FIREBASE_SERVICE_ACCOUNT_JSON is missing!")
+        logger.warning("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON is missing! Push notifications disabled.")
 except Exception as e:
     logger.error(f"❌ Firebase Error: {e}")
 
@@ -97,6 +97,11 @@ def _check_rate_limit(uid: str) -> bool:
     _rate_limit[uid] = timestamps
     return True
 
+def _clean_rate_limit(uid: str):
+    """Очистка памяти при отключении."""
+    if uid in _rate_limit:
+        del _rate_limit[uid]
+
 
 async def _send_to(ws: WebSocket, payload: dict):
     """Безопасная отправка JSON клиенту."""
@@ -136,15 +141,16 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
             data={"from_uid": from_uid, "type": message_type},
             token=token,
         )
-        # Запускаем синхронный вызов в thread pool, не блокируя event loop
+        # Запускаем синхронный вызов в thread pool
         await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
         logger.info(f"📲 Push sent to {target_uid} ({message_type})")
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
 
 
+# ─── Оффлайн сообщения (Global) ─────────────────────────────────────────────
 async def _send_offline_messages(websocket: WebSocket, my_uid: str):
-    """Доставка оффлайн-сообщений при подключении."""
+    """Доставка ВСЕХ оффлайн-сообщений при подключении (Legacy/Init)."""
     if not redis_client:
         return
     await asyncio.sleep(0.5)
@@ -152,28 +158,64 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
         offline_key = f"offline_queue:{my_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
         if messages:
-            logger.info(f"📬 Sending {len(messages)} offline messages to {my_uid}")
+            logger.info(f"📬 Sending {len(messages)} global offline messages to {my_uid}")
             for msg_json in messages:
                 try:
                     await websocket.send_text(msg_json)
-                    logger.info(f"📨 Sent offline message to {my_uid}")
                 except Exception as e:
                     logger.error(f"❌ Failed to send offline message: {e}")
             await redis_client.delete(offline_key)
-            logger.info(f"🗑️ Cleared offline queue for {my_uid}")
+            logger.info(f"🗑️ Cleared global offline queue for {my_uid}")
     except Exception as e:
         logger.error(f"❌ Error sending offline messages: {e}")
 
 
-async def _store_offline_message(target_uid: str, message_data: dict):
-    """Сохранение сообщения для оффлайн-доставки."""
+# ─── Оффлайн сообщения (Specific Sender) - NEW ──────────────────────────────
+async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_uid: str):
+    """Доставка оффлайн-сообщений от конкретного отправителя."""
     if not redis_client:
         return
     try:
-        offline_key = f"offline_queue:{target_uid}"
-        await redis_client.rpush(offline_key, json.dumps(message_data))
-        await redis_client.expire(offline_key, 7 * 24 * 3600)
-        logger.info(f"💾 Stored offline message for {target_uid}")
+        # Ключ для сообщений от конкретного отправителя
+        offline_key = f"offline:{my_uid}:from:{from_uid}"
+        messages = await redis_client.lrange(offline_key, 0, -1)
+        
+        if messages:
+            logger.info(f"📬 Sending {len(messages)} specific offline messages from {from_uid} to {my_uid}")
+            for msg_json in messages:
+                try:
+                    await websocket.send_text(msg_json)
+                except Exception as e:
+                    logger.error(f"❌ Failed to send specific offline message: {e}")
+            
+            # Удаляем отправленные сообщения
+            await redis_client.delete(offline_key)
+            logger.info(f"🗑️ Cleared specific offline queue for {my_uid} from {from_uid}")
+        else:
+            logger.debug(f"📭 No specific offline messages from {from_uid} for {my_uid}")
+            
+    except Exception as e:
+        logger.error(f"❌ Error sending specific offline messages from {from_uid}: {e}")
+
+
+async def _store_offline_message(target_uid: str, message_data: dict):
+    """Сохранение сообщения для оффлайн-доставки (Dual Storage)."""
+    if not redis_client:
+        return
+    try:
+        from_uid = message_data.get("from_uid", "unknown")
+        
+        # 1. Сохраняем в общую очередь (для старой логики init)
+        offline_key_global = f"offline_queue:{target_uid}"
+        await redis_client.rpush(offline_key_global, json.dumps(message_data))
+        await redis_client.expire(offline_key_global, 7 * 24 * 3600)
+        
+        # 2. НОВОЕ: Сохраняем по отправителям (для нового запроса)
+        offline_key_specific = f"offline:{target_uid}:from:{from_uid}"
+        await redis_client.rpush(offline_key_specific, json.dumps(message_data))
+        await redis_client.expire(offline_key_specific, 7 * 24 * 3600)
+        
+        logger.info(f"💾 Stored offline message for {target_uid} from {from_uid} (Dual storage)")
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
@@ -186,6 +228,7 @@ async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from
             return True
         except Exception as e:
             logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
+    
     await _store_offline_message(target_uid, payload)
     await _send_fcm_push(target_uid, from_uid, push_type)
     return False
@@ -197,15 +240,16 @@ async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from
 async def root():
     return {
         "status": "ONLINE",
-        "version": "4.1.0",
-        "firebase": "active" if firebase_admin._apps else "error",
+        "version": "4.2.0",
+        "firebase": "active" if firebase_admin._apps else "error/disabled",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections),
         "features": [
+            "dual_offline_storage", "request_offline_messages",
             "delete_message", "edit_message", "message_reaction",
             "forward_message", "read_receipt", "delivery_receipt",
             "voice_messages", "photo_messages", "file_transfer",
-            "server_ack", "rate_limiting", "uid_validation",
+            "server_ack", "rate_limiting",
         ],
     }
 
@@ -243,6 +287,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "my_uid": my_uid,
                 })
 
+                # Отправляем глобальные оффлайн сообщения (Legacy)
                 asyncio.create_task(_send_offline_messages(websocket, my_uid))
                 continue
 
@@ -252,6 +297,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "error",
                     "message": "Not initialized. Send init first."
                 })
+                continue
+
+            # ── NEW: REQUEST OFFLINE MESSAGES ─────────────────────────────
+            if msg_type == "request_offline_messages":
+                # Клиент отправляет 'target_uid' (с кем чатится), 
+                # для сервера это 'from_uid' (от кого достать сообщения)
+                target_from_uid = data.get("target_uid") or data.get("from_uid")
+                
+                if not target_from_uid:
+                    continue
+                
+                logger.info(f"📥 {my_uid} requested offline messages from {target_from_uid}")
+                await _send_offline_messages_from(websocket, my_uid, target_from_uid)
                 continue
 
             # ── REGISTER FCM TOKEN ────────────────────────────────────────
@@ -340,7 +398,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 delivered = await _deliver_or_store(target_uid, payload, "new_message", my_uid)
 
-                # ✅ server_ack — клиент ждёт это подтверждение
+                # ✅ server_ack
                 await _send_to(websocket, {
                     "type":             "server_ack",
                     "id":               message_id,
@@ -507,8 +565,10 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         if my_uid:
             active_connections.pop(my_uid, None)
+            _clean_rate_limit(my_uid) # Очистка памяти
             logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
         if my_uid:
             active_connections.pop(my_uid, None)
+            _clean_rate_limit(my_uid)
