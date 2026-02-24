@@ -225,21 +225,39 @@ async def _store_offline_message(target_uid: str, message_data: dict):
         logger.error(f"❌ Failed to store offline message: {e}")
 
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str):
-    """Пытается доставить сообщение онлайн. Если ошибка сокета — сохраняет в оффлайн + пуш."""
+    """
+    Пытается доставить сообщение онлайн. 
+    Если не выходит (ошибка сокета) — СРАЗУ удаляет сокет и сохраняет в оффлайн + пуш.
+    """
+    
+    # 1. Попытка онлайн доставки
     if target_uid in active_connections:
         ws = active_connections[target_uid]
         try:
+            # Проверка состояния сокета перед отправкой (косвенная)
+            if ws.client_state.name != "CONNECTED":
+                raise WebSocketDisconnect("Socket not connected")
+                
             await ws.send_text(json.dumps(payload))
-            return True 
+            return True  # Успешно доставлено онлайн
         except Exception as e:
             logger.error(f"❌ Failed to deliver to {target_uid}: {e}")
+            
+            # 🔥 CRITICAL FIX: Если отправка не удалась, значит сокет мертв.
+            # Удаляем его НЕМЕДЛЕННО, чтобы не пытаться слать туда снова
+            # и чтобы следующие сообщения сразу шли в оффлайн/пуш.
             logger.warning(f"🔌 Removing dead connection for {target_uid}")
             if target_uid in active_connections:
                 del active_connections[target_uid]
+            
+            # Пропускаем flow дальше к сохранению в оффлайн
     
+    # 2. Если пользователя нет в active_connections ИЛИ отправка упала с ошибкой:
     logger.info(f"💤 User {target_uid} is offline/unreachable. Storing & Pushing.")
+    
     await _store_offline_message(target_uid, payload)
     await _send_fcm_push(target_uid, from_uid, push_type)
+    
     return False
 
 
