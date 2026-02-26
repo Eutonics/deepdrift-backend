@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="4.5.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="4.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
@@ -53,7 +53,6 @@ try:
 except Exception as e:
     logger.error(f"❌ Firebase Error: {e}")
 
-
 # ─── Redis ──────────────────────────────────────────────────────────────────
 async def init_redis():
     global redis_client
@@ -79,9 +78,7 @@ async def init_redis():
 async def startup_event():
     await init_redis()
 
-
 # ─── Хелперы ────────────────────────────────────────────────────────────────
-
 def _now_ms() -> int:
     return int(datetime.now().timestamp() * 1000)
 
@@ -102,21 +99,26 @@ def _clean_rate_limit(uid: str):
     if uid in _rate_limit:
         del _rate_limit[uid]
 
-async def _send_to(ws: WebSocket, payload: dict):
-    try:
-        await ws.send_text(json.dumps(payload))
-    except Exception as e:
-        logger.error(f"❌ send_to error: {e}")
-
 async def _update_last_seen(uid: str):
-    """Обновляет время последней активности пользователя в Redis"""
     if redis_client:
         try:
             await redis_client.set(f"last_seen:{uid}", _now_ms())
         except Exception:
             pass
 
-# ─── Push и Оффлайн сообщения ───────────────────────────────────────────────
+# ─── УМНАЯ ОТПРАВКА И ОЧЕРЕДИ ───────────────────────────────────────────────
+
+async def _send_to(ws: WebSocket, payload: dict) -> bool:
+    """Пытается отправить сообщение в сокет. Возвращает True, если успех."""
+    try:
+        if ws.client_state.name != "CONNECTED":
+            return False
+        await ws.send_text(json.dumps(payload))
+        return True
+    except Exception as e:
+        # Логируем только как Warning, так как это ожидаемо при обрыве сети
+        logger.warning(f"⚠️ Socket write error (client disconnected): {e}")
+        return False
 
 async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message"):
     if not redis_client or not firebase_admin._apps:
@@ -126,10 +128,11 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         if not token:
             return
 
-        # Попытка получить никнейм отправителя для красивого пуша
+        # Пытаемся достать красивый Никнейм из базы
         sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
         sender_name = sender_profile.get("nickname", from_uid) if sender_profile else from_uid
 
+        # Секретный формат пуша a-la Signal
         title_map = {
             "new_message":       f"DDChat: {sender_name}",
             "message_deleted":   "Message deleted",
@@ -137,7 +140,7 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
             "message_reaction":  "New reaction",
         }
         body_map = {
-            "new_message":       "New encrypted message or media",
+            "new_message":       "New encrypted message",
             "message_deleted":   "A message was deleted",
             "message_edited":    "A message was edited",
             "message_reaction":  "New reaction on your message",
@@ -159,7 +162,6 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
 
-
 async def _send_offline_messages(websocket: WebSocket, my_uid: str):
     if not redis_client: return
     await asyncio.sleep(0.5)
@@ -167,10 +169,20 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
         offline_key = f"offline_queue:{my_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
         if messages:
+            logger.info(f"📬 Sending {len(messages)} global offline messages to {my_uid}")
+            success_count = 0
             for msg_json in messages:
-                try: await websocket.send_text(msg_json)
-                except Exception: pass
-            await redis_client.delete(offline_key)
+                if await _send_to(websocket, json.loads(msg_json)):
+                    success_count += 1
+                else:
+                    break # Обрыв связи, прекращаем попытки
+            
+            # Удаляем только те, что смогли отправить
+            if success_count > 0:
+                await redis_client.ltrim(offline_key, success_count, -1)
+                
+            if success_count == len(messages):
+                logger.info(f"🗑️ Cleared global offline queue for {my_uid}")
     except Exception as e:
         logger.error(f"❌ Error sending offline messages: {e}")
 
@@ -180,10 +192,19 @@ async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_ui
         offline_key = f"offline:{my_uid}:from:{from_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
         if messages:
+            logger.info(f"📬 Sending {len(messages)} specific offline messages from {from_uid} to {my_uid}")
+            success_count = 0
             for msg_json in messages:
-                try: await websocket.send_text(msg_json)
-                except Exception: pass
-            await redis_client.delete(offline_key)
+                if await _send_to(websocket, json.loads(msg_json)):
+                    success_count += 1
+                else:
+                    break
+            
+            if success_count > 0:
+                await redis_client.ltrim(offline_key, success_count, -1)
+                
+            if success_count == len(messages):
+                logger.info(f"🗑️ Cleared specific offline queue for {my_uid} from {from_uid}")
     except Exception as e:
         logger.error(f"❌ Error sending specific offline messages: {e}")
 
@@ -203,21 +224,24 @@ async def _store_offline_message(target_uid: str, message_data: dict):
         logger.error(f"❌ Failed to store offline message: {e}")
 
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str):
+    delivered = False
+    
     if target_uid in active_connections:
         ws = active_connections[target_uid]
-        try:
-            if ws.client_state.name != "CONNECTED":
-                raise WebSocketDisconnect("Socket not connected")
-            await ws.send_text(json.dumps(payload))
-            return True 
-        except Exception as e:
-            if target_uid in active_connections:
-                del active_connections[target_uid]
+        delivered = await _send_to(ws, payload)
+        
+        # Если доставка не удалась, немедленно удаляем мертвый сокет
+        if not delivered:
+            logger.warning(f"🔌 Removing dead connection for {target_uid}")
+            del active_connections[target_uid]
     
-    await _store_offline_message(target_uid, payload)
-    await _send_fcm_push(target_uid, from_uid, push_type)
-    return False
-
+    # Если юзер не в сети ИЛИ отправка только что провалилась
+    if not delivered:
+        logger.info(f"💤 User {target_uid} is offline/unreachable. Storing & Pushing.")
+        await _store_offline_message(target_uid, payload)
+        await _send_fcm_push(target_uid, from_uid, push_type)
+        
+    return delivered
 
 # ─── REST эндпоинты (HTTP) ──────────────────────────────────────────────────
 
@@ -225,7 +249,7 @@ async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from
 async def root():
     return {
         "status": "ONLINE",
-        "version": "4.5.0",
+        "version": "4.6.0",
         "firebase": "active" if firebase_admin._apps else "error/disabled",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections),
@@ -248,6 +272,8 @@ async def download_file(file_id: str):
     file_path = os.path.join(UPLOAD_DIR, safe_file_id)
     if os.path.exists(file_path):
         return FileResponse(file_path)
+    # Понизили уровень лога до Warning, чтобы не засорять консоль
+    logger.warning(f"⚠️ HTTP Download failed (not found): {safe_file_id}")
     return {"status": "error", "message": "File not found"}
 
 
@@ -264,7 +290,6 @@ async def websocket_endpoint(websocket: WebSocket):
             data = json.loads(raw)
             msg_type = data.get("type")
 
-            # ── INIT ──────────────────────────────────────────────────────
             if msg_type == "init":
                 uid_candidate = str(data.get("my_uid", "")).strip()
 
@@ -274,7 +299,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 my_uid = uid_candidate
                 active_connections[my_uid] = websocket
-                await _update_last_seen(my_uid) # Обновляем онлайн статус
+                await _update_last_seen(my_uid) 
                 
                 logger.info(f"✅ {my_uid} connected (total: {len(active_connections)})")
 
@@ -286,9 +311,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 await _send_to(websocket, {"type": "error", "message": "Not initialized."})
                 continue
 
-            await _update_last_seen(my_uid) # Любое действие обновляет статус
+            await _update_last_seen(my_uid) 
 
-            # ── ПРОФИЛИ И СТАТУСЫ (НОВЫЙ ФУНКЦИОНАЛ) ──────────────────────
             if msg_type == "update_profile":
                 nickname = data.get("nickname", "")
                 avatar_id = data.get("avatar_id", "")
@@ -331,7 +355,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                 continue
 
-            # ── ОСТАЛЬНЫЕ БАЗОВЫЕ МЕТОДЫ ──────────────────────────────────
             if msg_type == "request_offline_messages":
                 target_from_uid = data.get("target_uid") or data.get("from_uid")
                 if target_from_uid:
@@ -364,7 +387,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                 continue
 
-            # ── СООБЩЕНИЯ ─────────────────────────────────────────────────
             if msg_type == "message":
                 if not _check_rate_limit(my_uid): continue
                 target_uid = data.get("target_uid")
@@ -443,13 +465,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"❌ WebSocket loop error: {e}")
+    finally:
+        # Это гарантированно выполнится при обрыве соединения
         if my_uid:
             if my_uid in active_connections and active_connections[my_uid] == websocket:
                 active_connections.pop(my_uid, None)
-                await _update_last_seen(my_uid) # Сохраняем время выхода
-            _clean_rate_limit(my_uid)
-    except Exception as e:
-        if my_uid and my_uid in active_connections and active_connections[my_uid] == websocket:
-            active_connections.pop(my_uid, None)
-            await _update_last_seen(my_uid)
+                await _update_last_seen(my_uid) 
+                logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
             _clean_rate_limit(my_uid)
