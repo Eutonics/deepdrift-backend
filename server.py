@@ -20,14 +20,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="4.6.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="4.7.0") # Версия повышена
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
 REDIS_URL = os.environ.get("REDIS_URL")
 FB_JSON   = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
-UID_PATTERN = re.compile(r"^\d{6}$")  # UID — строго 6 цифр
+UID_PATTERN = re.compile(r"^\d{6}$")  # UID — строго 6 цифр (для личных)
+# Групповые ID будут начинаться с 'g_'
 
 # ─── Директория для файлов ──────────────────────────────────────────────────
 UPLOAD_DIR = "uploads"
@@ -83,6 +84,7 @@ def _now_ms() -> int:
     return int(datetime.now().timestamp() * 1000)
 
 def _is_valid_uid(uid: str) -> bool:
+    # Теперь пускаем и личные ID (6 цифр) и сессии, но регистрация только для 6 цифр
     return bool(uid and UID_PATTERN.match(str(uid)))
 
 def _check_rate_limit(uid: str) -> bool:
@@ -119,8 +121,8 @@ async def _send_to(ws: WebSocket, payload: dict) -> bool:
         logger.warning(f"⚠️ Socket write error (client disconnected): {e}")
         return False
 
-# ─── ИСПРАВЛЕННЫЙ DATA-ONLY PUSH ────────────────────────────────────────────
-async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message"):
+# ─── БРОНЕБОЙНЫЙ DATA-ONLY PUSH ─────────────────────────────────────────────
+async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message", group_id: str = None):
     if not redis_client or not firebase_admin._apps:
         return
     try:
@@ -128,29 +130,28 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         if not token:
             return
 
-        # Пытаемся достать красивый Никнейм из базы
         sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
         sender_name = sender_profile.get("nickname", from_uid) if sender_profile else from_uid
 
         # СЕКРЕТНЫЙ ФОРМАТ PUSH (Data-only)
-        # Блок notification УДАЛЕН. Система не будет перехватывать пуш.
-        # Вся инфа летит скрытым пейлоадом прямиком во Flutter.
+        data_payload = {
+            "from_uid": from_uid, 
+            "sender_name": sender_name,
+            "type": message_type,
+            "click_action": "FLUTTER_NOTIFICATION_CLICK"
+        }
+        
+        # Если это сообщение в группу, передаем ID группы, чтобы Flutter знал, какой чат открыть
+        if group_id:
+            data_payload["target_uid"] = group_id 
+
         msg = messaging.Message(
-            data={
-                "from_uid": from_uid, 
-                "sender_name": sender_name,
-                "type": message_type,
-                "click_action": "FLUTTER_NOTIFICATION_CLICK"
-            },
+            data=data_payload,
             token=token,
-            android=messaging.AndroidConfig(
-                priority='high' # Критично важно для пробуждения спящего Android
-            ),
+            android=messaging.AndroidConfig(priority='high'),
             apns=messaging.APNSConfig(
                 headers={'apns-priority': '10', 'apns-push-type': 'background'},
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(content_available=True) # Критично для iOS
-                )
+                payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True))
             )
         )
         
@@ -158,7 +159,8 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         logger.info(f"📲 Data-only Push sent to {target_uid} ({message_type})")
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
-# ────────────────────────────────────────────────────────────────────────────
+
+# ─── ОФФЛАЙН ОЧЕРЕДИ ────────────────────────────────────────────────────────
 
 async def _send_offline_messages(websocket: WebSocket, my_uid: str):
     if not redis_client: return
@@ -173,12 +175,9 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
                 if await _send_to(websocket, json.loads(msg_json)):
                     success_count += 1
                 else:
-                    break # Обрыв связи, прекращаем попытки
-            
-            # Удаляем только те, что смогли отправить
+                    break 
             if success_count > 0:
                 await redis_client.ltrim(offline_key, success_count, -1)
-                
             if success_count == len(messages):
                 logger.info(f"🗑️ Cleared global offline queue for {my_uid}")
     except Exception as e:
@@ -197,10 +196,8 @@ async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_ui
                     success_count += 1
                 else:
                     break
-            
             if success_count > 0:
                 await redis_client.ltrim(offline_key, success_count, -1)
-                
             if success_count == len(messages):
                 logger.info(f"🗑️ Cleared specific offline queue for {my_uid} from {from_uid}")
     except Exception as e:
@@ -221,25 +218,43 @@ async def _store_offline_message(target_uid: str, message_data: dict):
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
-async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str):
+# ─── РОУТИНГ (ЛИЧНЫЙ ЧАТ ИЛИ ГРУППА) ────────────────────────────────────────
+
+async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str, group_id: str = None):
+    """Отправляет конкретному юзеру или сохраняет в его оффлайн очередь."""
     delivered = False
     
     if target_uid in active_connections:
         ws = active_connections[target_uid]
         delivered = await _send_to(ws, payload)
-        
-        # Если доставка не удалась, немедленно удаляем мертвый сокет
         if not delivered:
             logger.warning(f"🔌 Removing dead connection for {target_uid}")
             del active_connections[target_uid]
     
-    # Если юзер не в сети ИЛИ отправка только что провалилась
     if not delivered:
         logger.info(f"💤 User {target_uid} is offline/unreachable. Storing & Pushing.")
         await _store_offline_message(target_uid, payload)
-        await _send_fcm_push(target_uid, from_uid, push_type)
+        await _send_fcm_push(target_uid, from_uid, push_type, group_id)
         
     return delivered
+
+async def _route_message(target_uid: str, payload: dict, push_type: str, from_uid: str):
+    """Умный роутинг: если target_uid начинается с g_, рассылает всем участникам."""
+    if target_uid.startswith("g_"):
+        # Это ГРУППА
+        if redis_client:
+            members = await redis_client.smembers(f"group:{target_uid}")
+            delivered_any = False
+            for member in members:
+                if member != from_uid: # Не отправляем самому себе
+                    deliv = await _deliver_or_store(member, payload, push_type, from_uid, group_id=target_uid)
+                    if deliv: delivered_any = True
+            return delivered_any
+        return False
+    else:
+        # Это ЛИЧНОЕ СООБЩЕНИЕ
+        return await _deliver_or_store(target_uid, payload, push_type, from_uid)
+
 
 # ─── REST эндпоинты (HTTP) ──────────────────────────────────────────────────
 
@@ -247,7 +262,7 @@ async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from
 async def root():
     return {
         "status": "ONLINE",
-        "version": "4.6.0",
+        "version": "4.7.0",
         "firebase": "active" if firebase_admin._apps else "error/disabled",
         "redis": "connected" if redis_client else "disconnected",
         "users_online": len(active_connections),
@@ -289,7 +304,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "init":
                 uid_candidate = str(data.get("my_uid", "")).strip()
-
                 if not _is_valid_uid(uid_candidate):
                     await _send_to(websocket, {"type": "error", "message": "Invalid UID"})
                     continue
@@ -299,7 +313,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await _update_last_seen(my_uid) 
                 
                 logger.info(f"✅ {my_uid} connected (total: {len(active_connections)})")
-
                 await _send_to(websocket, {"type": "uid_assigned", "my_uid": my_uid})
                 asyncio.create_task(_send_offline_messages(websocket, my_uid))
                 continue
@@ -310,14 +323,24 @@ async def websocket_endpoint(websocket: WebSocket):
 
             await _update_last_seen(my_uid) 
 
+            # --- ГРУППОВЫЕ ЧАТЫ: СОЗДАНИЕ В БАЗЕ ---
+            if msg_type == "create_group":
+                group_id = data.get("group_id")
+                members = data.get("members",[])
+                if redis_client and group_id and members:
+                    # Убедимся, что создатель тоже в списке
+                    if my_uid not in members:
+                        members.append(my_uid)
+                    await redis_client.sadd(f"group:{group_id}", *members)
+                    await _send_to(websocket, {"type": "group_created", "group_id": group_id})
+                continue
+            # ----------------------------------------
+
             if msg_type == "update_profile":
                 nickname = data.get("nickname", "")
                 avatar_id = data.get("avatar_id", "")
                 if redis_client:
-                    await redis_client.hset(f"profile:{my_uid}", mapping={
-                        "nickname": nickname, 
-                        "avatar_id": avatar_id
-                    })
+                    await redis_client.hset(f"profile:{my_uid}", mapping={"nickname": nickname, "avatar_id": avatar_id})
                     await _send_to(websocket, {"type": "profile_updated", "status": "success"})
                 continue
 
@@ -329,8 +352,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_seen = await redis_client.get(f"last_seen:{target_uid}")
                     
                     await _send_to(websocket, {
-                        "type": "profile_response",
-                        "uid": target_uid,
+                        "type": "profile_response", "uid": target_uid,
                         "nickname": prof.get("nickname", target_uid),
                         "avatar_id": prof.get("avatar_id", ""),
                         "status": "online" if is_online else "offline",
@@ -342,11 +364,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 uids = data.get("uids",[])
                 if redis_client and isinstance(uids, list):
                     for u in uids:
+                        # Пропускаем группы из проверки статуса "В сети"
+                        if str(u).startswith("g_"): continue
                         is_online = u in active_connections
                         last_seen = await redis_client.get(f"last_seen:{u}")
                         await _send_to(websocket, {
-                            "type": "user_status",
-                            "uid": u,
+                            "type": "user_status", "uid": u,
                             "status": "online" if is_online else "offline",
                             "last_seen": int(last_seen) if last_seen else 0
                         })
@@ -393,6 +416,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload = {
                     "type":          "message",
                     "from_uid":      my_uid,
+                    "target_uid":    target_uid, # Добавлено для групп, чтобы получатель знал в какой чат положить
                     "id":            message_id,
                     "encrypted_text": data.get("encrypted_text"),
                     "signature":     data.get("signature"),
@@ -405,7 +429,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "mimeType":      data.get("mimeType"),
                 }
 
-                delivered = await _deliver_or_store(target_uid, payload, "new_message", my_uid)
+                # УМНЫЙ РОУТИНГ (РАССЫЛКА ГРУППЕ ИЛИ ЛИЧНО)
+                delivered = await _route_message(target_uid, payload, "new_message", my_uid)
                 await _send_to(websocket, {"type": "server_ack", "id": message_id, "delivered_online": delivered})
                 continue
 
@@ -413,8 +438,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 target_uid = data.get("target_uid")
                 message_id = data.get("message_id")
                 if target_uid and message_id:
-                    payload = {"type": "message_deleted", "from_uid": my_uid, "message_id": message_id, "time": _now_ms()}
-                    await _deliver_or_store(target_uid, payload, "message_deleted", my_uid)
+                    payload = {"type": "message_deleted", "target_uid": target_uid, "from_uid": my_uid, "message_id": message_id, "time": _now_ms()}
+                    await _route_message(target_uid, payload, "message_deleted", my_uid)
                 continue
 
             if msg_type == "edit_message":
@@ -422,11 +447,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 message_id = data.get("message_id")
                 if target_uid and message_id:
                     payload = {
-                        "type": "message_edited", "from_uid": my_uid, "message_id": message_id,
+                        "type": "message_edited", "target_uid": target_uid, "from_uid": my_uid, "message_id": message_id,
                         "new_encrypted_text": data.get("new_encrypted_text"),
                         "new_signature": data.get("new_signature"), "time": _now_ms()
                     }
-                    await _deliver_or_store(target_uid, payload, "message_edited", my_uid)
+                    await _route_message(target_uid, payload, "message_edited", my_uid)
                 continue
 
             if msg_type == "message_reaction":
@@ -434,17 +459,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 message_id = data.get("message_id")
                 if target_uid and message_id:
                     payload = {
-                        "type": "message_reaction", "from_uid": my_uid, "message_id": message_id,
+                        "type": "message_reaction", "target_uid": target_uid, "from_uid": my_uid, "message_id": message_id,
                         "emoji": data.get("emoji"), "action": data.get("action"), "time": _now_ms()
                     }
-                    await _deliver_or_store(target_uid, payload, "message_reaction", my_uid)
+                    await _route_message(target_uid, payload, "message_reaction", my_uid)
                 continue
 
             if msg_type == "read_receipt" or msg_type == "delivery_receipt":
                 target_uid = data.get("target_uid")
                 if target_uid and target_uid in active_connections:
                      await _send_to(active_connections[target_uid], {
-                         "type": msg_type, "from_uid": my_uid,
+                         "type": msg_type, "from_uid": my_uid, "target_uid": target_uid,
                          "message_id": data.get("message_id"), "time": _now_ms()
                      })
                 continue
@@ -453,7 +478,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 target_uid = data.get("target_uid")
                 if target_uid and target_uid in active_connections:
                     await _send_to(active_connections[target_uid], {
-                        "type": "typing_indicator", "from_uid": my_uid, "typing": data.get("typing", False)
+                        "type": "typing_indicator", "from_uid": my_uid, "target_uid": target_uid, "typing": data.get("typing", False)
                     })
                 continue
 
@@ -466,7 +491,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"❌ WebSocket loop error: {e}")
     finally:
-        # Это гарантированно выполнится при обрыве соединения
         if my_uid:
             if my_uid in active_connections and active_connections[my_uid] == websocket:
                 active_connections.pop(my_uid, None)
