@@ -88,7 +88,7 @@ def _is_valid_uid(uid: str) -> bool:
 def _check_rate_limit(uid: str) -> bool:
     now = datetime.now().timestamp()
     timestamps = _rate_limit.get(uid, [])
-    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    timestamps =[t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
     if len(timestamps) >= RATE_LIMIT_MAX:
         return False
     timestamps.append(now)
@@ -116,10 +116,10 @@ async def _send_to(ws: WebSocket, payload: dict) -> bool:
         await ws.send_text(json.dumps(payload))
         return True
     except Exception as e:
-        # Логируем только как Warning, так как это ожидаемо при обрыве сети
         logger.warning(f"⚠️ Socket write error (client disconnected): {e}")
         return False
 
+# ─── ИСПРАВЛЕННЫЙ DATA-ONLY PUSH ────────────────────────────────────────────
 async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "new_message"):
     if not redis_client or not firebase_admin._apps:
         return
@@ -132,35 +132,33 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
         sender_name = sender_profile.get("nickname", from_uid) if sender_profile else from_uid
 
-        # Секретный формат пуша a-la Signal
-        title_map = {
-            "new_message":       f"DDChat: {sender_name}",
-            "message_deleted":   "Message deleted",
-            "message_edited":    "Message edited",
-            "message_reaction":  "New reaction",
-        }
-        body_map = {
-            "new_message":       "New encrypted message",
-            "message_deleted":   "A message was deleted",
-            "message_edited":    "A message was edited",
-            "message_reaction":  "New reaction on your message",
-        }
-
+        # СЕКРЕТНЫЙ ФОРМАТ PUSH (Data-only)
+        # Блок notification УДАЛЕН. Система не будет перехватывать пуш.
+        # Вся инфа летит скрытым пейлоадом прямиком во Flutter.
         msg = messaging.Message(
-            notification=messaging.Notification(
-                title=title_map.get(message_type, "DDChat"),
-                body=body_map.get(message_type, "New event"),
-            ),
-            data={"from_uid": from_uid, "type": message_type},
+            data={
+                "from_uid": from_uid, 
+                "sender_name": sender_name,
+                "type": message_type,
+                "click_action": "FLUTTER_NOTIFICATION_CLICK"
+            },
             token=token,
-            android=messaging.AndroidConfig(priority='high'),
-            apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)))
+            android=messaging.AndroidConfig(
+                priority='high' # Критично важно для пробуждения спящего Android
+            ),
+            apns=messaging.APNSConfig(
+                headers={'apns-priority': '10', 'apns-push-type': 'background'},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(content_available=True) # Критично для iOS
+                )
+            )
         )
         
         await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
-        logger.info(f"📲 Push sent to {target_uid} ({message_type})")
+        logger.info(f"📲 Data-only Push sent to {target_uid} ({message_type})")
     except Exception as e:
         logger.error(f"❌ Push Send Error: {e}")
+# ────────────────────────────────────────────────────────────────────────────
 
 async def _send_offline_messages(websocket: WebSocket, my_uid: str):
     if not redis_client: return
@@ -272,7 +270,6 @@ async def download_file(file_id: str):
     file_path = os.path.join(UPLOAD_DIR, safe_file_id)
     if os.path.exists(file_path):
         return FileResponse(file_path)
-    # Понизили уровень лога до Warning, чтобы не засорять консоль
     logger.warning(f"⚠️ HTTP Download failed (not found): {safe_file_id}")
     return {"status": "error", "message": "File not found"}
 
@@ -342,7 +339,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if msg_type == "check_statuses":
-                uids = data.get("uids", [])
+                uids = data.get("uids",[])
                 if redis_client and isinstance(uids, list):
                     for u in uids:
                         is_online = u in active_connections
