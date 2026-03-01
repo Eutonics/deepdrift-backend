@@ -286,7 +286,8 @@ async def download_file(file_id: str):
     if os.path.exists(file_path):
         return FileResponse(file_path)
     logger.warning(f"⚠️ HTTP Download failed (not found): {safe_file_id}")
-    return {"status": "error", "message": "File not found"}
+    from fastapi import Response
+    return Response(status_code=404, content="File not found")
 
 
 # ─── WebSocket ──────────────────────────────────────────────────────────────
@@ -337,8 +338,8 @@ async def websocket_endpoint(websocket: WebSocket):
             # ----------------------------------------
 
             if msg_type == "update_profile":
-                nickname = data.get("nickname", "")
-                avatar_id = data.get("avatar_id", "")
+                nickname  = data.get("nickname") or ""
+                avatar_id = data.get("avatar_id") or ""
                 if redis_client:
                     await redis_client.hset(f"profile:{my_uid}", mapping={"nickname": nickname, "avatar_id": avatar_id})
                     await _send_to(websocket, {"type": "profile_updated", "status": "success"})
@@ -413,7 +414,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 message_id = data.get("id")
                 if not target_uid or not message_id: continue
 
-                payload = {
+                raw_payload = {
                     "type":          "message",
                     "from_uid":      my_uid,
                     "target_uid":    target_uid, # Добавлено для групп, чтобы получатель знал в какой чат положить
@@ -428,6 +429,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "fileSize":      data.get("fileSize"),
                     "mimeType":      data.get("mimeType"),
                 }
+                # Убираем ключи с None — json.dumps их сериализует как null,
+                # но некоторые Redis-операции падают с NoneType при прямой подстановке.
+                payload = {k: v for k, v in raw_payload.items() if v is not None}
 
                 # УМНЫЙ РОУТИНГ (РАССЫЛКА ГРУППЕ ИЛИ ЛИЧНО)
                 delivered = await _route_message(target_uid, payload, "new_message", my_uid)
