@@ -5,11 +5,13 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import uuid
 from datetime import datetime
 from typing import Dict, Optional
 
+import boto3
+from botocore.exceptions import ClientError
+from botocore.config import Config
 import redis.asyncio as redis
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -24,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("DDChatRelay")
 
 # ─── Приложение ─────────────────────────────────────────────────────────────
-app = FastAPI(title="DeepDrift Secure Relay", version="5.0.0")
+app = FastAPI(title="DeepDrift Secure Relay", version="5.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Конфигурация ───────────────────────────────────────────────────────────
@@ -33,9 +35,43 @@ FB_JSON   = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 UID_PATTERN = re.compile(r"^\d{6}$")  # UID — строго 6 цифр
 
-# ─── Директория для файлов (Render ephemeral — для S3 замени позже) ─────────
+# ─── Cloudflare R2 (S3-совместимое постоянное хранилище) ────────────────────
+# Переменные окружения (добавь в Render → Environment):
+#   R2_ENDPOINT_URL    — https://<account_id>.r2.cloudflarestorage.com
+#   R2_ACCESS_KEY_ID   — Access Key ID из API Token
+#   R2_SECRET_KEY      — Secret Access Key из API Token
+#   R2_BUCKET_NAME     — имя bucket (напр. ddchat-files)
+R2_ENDPOINT  = os.environ.get("R2_ENDPOINT_URL", "")
+R2_KEY_ID    = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET    = os.environ.get("R2_SECRET_KEY", "")
+R2_BUCKET    = os.environ.get("R2_BUCKET_NAME", "ddchat-files")
+
+# Fallback: локальная папка если R2 не настроен (не пропадёт при рестарте, но и не надёжно)
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def _get_r2_client():
+    """Создаёт boto3 S3-клиент для Cloudflare R2. Возвращает None если не настроен."""
+    if not all([R2_ENDPOINT, R2_KEY_ID, R2_SECRET]):
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_KEY_ID,
+        aws_secret_access_key=R2_SECRET,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 3, "mode": "standard"},
+        ),
+        region_name="auto",
+    )
+
+# Инициализируем клиент при старте
+_r2 = _get_r2_client()
+if _r2:
+    logger.info(f"✅ R2 storage configured: bucket={R2_BUCKET}")
+else:
+    logger.warning("⚠️ R2 not configured — using local disk (ephemeral on Render!)")
 
 # ─── Auth константы ─────────────────────────────────────────────────────────
 NONCE_TTL_SECONDS = 60    # nonce живёт 60 секунд
@@ -408,32 +444,81 @@ async def _handle_register(websocket: WebSocket, uid: str, data: dict):
 async def root():
     return {
         "status":       "ONLINE",
-        "version":      "5.0.0",
+        "version":      "5.1.0",
         "firebase":     "active" if firebase_admin._apps else "error/disabled",
         "redis":        "connected" if redis_client else "disconnected",
+        "storage":      f"r2:{R2_BUCKET}" if _r2 else "local_disk (ephemeral!)",
         "users_online": len(active_connections),
     }
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        file_id   = f"{uuid.uuid4().hex}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, file_id)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Безопасное имя: uuid + оригинальное имя без директорий
+        safe_name = os.path.basename(file.filename or "file")
+        file_id   = f"{uuid.uuid4().hex}_{safe_name}"
+        file_data = await file.read()
+
+        if _r2:
+            # ── Загружаем в Cloudflare R2 ────────────────────────────────────
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _r2.put_object(
+                    Bucket=R2_BUCKET,
+                    Key=file_id,
+                    Body=file_data,
+                    ContentType=file.content_type or "application/octet-stream",
+                ),
+            )
+            logger.info(f"📦 Uploaded to R2: {file_id} ({len(file_data)} bytes)")
+        else:
+            # ── Fallback: локальный диск ──────────────────────────────────────
+            file_path = os.path.join(UPLOAD_DIR, file_id)
+            with open(file_path, "wb") as f:
+                f.write(file_data)
+            logger.info(f"💾 Saved locally: {file_id} ({len(file_data)} bytes)")
+
         return {"status": "success", "file_id": file_id}
     except Exception as e:
+        logger.error(f"❌ Upload error: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/download/{file_id}")
 async def download_file(file_id: str):
-    safe_file_id = os.path.basename(file_id)
-    file_path    = os.path.join(UPLOAD_DIR, safe_file_id)
-    if os.path.exists(file_path):
-        return FileResponse(file_path)
-    logger.warning(f"⚠️ HTTP Download failed (not found): {safe_file_id}")
     from fastapi import Response
-    return Response(status_code=404, content="File not found")
+    from fastapi.responses import StreamingResponse
+    import io
+
+    safe_file_id = os.path.basename(file_id)
+
+    if _r2:
+        # ── Отдаём из Cloudflare R2 ──────────────────────────────────────────
+        try:
+            obj = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _r2.get_object(Bucket=R2_BUCKET, Key=safe_file_id),
+            )
+            body         = obj["Body"].read()
+            content_type = obj.get("ContentType", "application/octet-stream")
+            return StreamingResponse(
+                io.BytesIO(body),
+                media_type=content_type,
+                headers={"Content-Disposition": f"attachment; filename={safe_file_id}"},
+            )
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("NoSuchKey", "404"):
+                logger.warning(f"⚠️ R2 Download not found: {safe_file_id}")
+                return Response(status_code=404, content="File not found")
+            logger.error(f"❌ R2 Download error: {e}")
+            return Response(status_code=500, content="Storage error")
+    else:
+        # ── Fallback: локальный диск ─────────────────────────────────────────
+        file_path = os.path.join(UPLOAD_DIR, safe_file_id)
+        if os.path.exists(file_path):
+            return FileResponse(file_path)
+        logger.warning(f"⚠️ Local Download not found: {safe_file_id}")
+        return Response(status_code=404, content="File not found")
 
 
 # ─── WebSocket ──────────────────────────────────────────────────────────────
