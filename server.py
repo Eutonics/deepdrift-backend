@@ -679,9 +679,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     "fileName":       data.get("fileName"),
                     "fileSize":       data.get("fileSize"),
                     "mimeType":       data.get("mimeType"),
+                    "group_id":       data.get("group_id"),
                 }
-                payload   = {k: v for k, v in raw_payload.items() if v is not None}
+                payload = {k: v for k, v in raw_payload.items() if v is not None}
+
+                # Для группы: fan-out всем участникам через _route_message.
+                # Групповое сообщение зашифровано симметричным ключом группы (один payload).
                 delivered = await _route_message(target_uid, payload, "new_message", my_uid)
+
                 await _send_to(websocket, {"type": "server_ack", "id": message_id, "delivered_online": delivered})
                 continue
 
@@ -749,6 +754,41 @@ async def websocket_endpoint(websocket: WebSocket):
                         "target_uid": target_uid,
                         "typing":     data.get("typing", False),
                     })
+                continue
+
+            # ── ГРУППОВЫЕ КЛЮЧИ ───────────────────────────────────────────────────
+            # Создатель шлёт зашифрованные копии группового ключа для каждого участника.
+            # Сервер хранит их в Redis; каждый участник получает только свою копию.
+            if msg_type == "distribute_group_keys":
+                group_id      = data.get("group_id")
+                encrypted_keys = data.get("encrypted_keys", {})  # {uid: encryptedBlob}
+                if redis_client and group_id and encrypted_keys:
+                    for uid, blob in encrypted_keys.items():
+                        key = f"group_key:{group_id}:{uid}"
+                        await redis_client.set(key, json.dumps({
+                            "blob":    blob,
+                            "creator": my_uid,
+                        }))
+                    logger.info(f"🔑 Group keys stored for {group_id} ({len(encrypted_keys)} members)")
+                continue
+
+            if msg_type == "get_group_key":
+                group_id = data.get("group_id")
+                if redis_client and group_id:
+                    raw = await redis_client.get(f"group_key:{group_id}:{my_uid}")
+                    if raw:
+                        entry = json.loads(raw)
+                        await _send_to(websocket, {
+                            "type":          "group_key_response",
+                            "group_id":      group_id,
+                            "encrypted_key": entry.get("blob"),
+                            "creator_uid":   entry.get("creator"),
+                        })
+                    else:
+                        await _send_to(websocket, {
+                            "type":     "group_key_not_found",
+                            "group_id": group_id,
+                        })
                 continue
 
             if msg_type == "ping":
