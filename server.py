@@ -677,7 +677,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type":       "group_invited",
                         "group_id":   group_id,
                         "group_name": group_name,
-                        "creator":    my_uid,
+                        "creator_uid": my_uid,
+                        "from_uid":   my_uid,
                         "members":    members,
                     }
                     for member_uid in members:
@@ -698,17 +699,30 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "get_profile":
                 target_uid = data.get("target_uid")
                 if redis_client and target_uid:
-                    prof      = await redis_client.hgetall(f"profile:{target_uid}")
-                    is_online = target_uid in active_connections
-                    last_seen = await redis_client.get(f"last_seen:{target_uid}")
-                    await _send_to(websocket, {
-                        "type":      "profile_response",
-                        "uid":       target_uid,
-                        "nickname":  prof.get("nickname", target_uid),
-                        "avatar_id": prof.get("avatar_id", ""),
-                        "status":    "online" if is_online else "offline",
-                        "last_seen": int(last_seen) if last_seen else 0,
-                    })
+                    # Если это группа — возвращаем данные группы
+                    if str(target_uid).startswith("g_"):
+                        group_name = await redis_client.get(f"group_name:{target_uid}") or target_uid
+                        members    = list(await redis_client.smembers(f"group:{target_uid}"))
+                        await _send_to(websocket, {
+                            "type":       "profile_response",
+                            "uid":        target_uid,
+                            "nickname":   group_name,
+                            "group_name": group_name,
+                            "members":    members,
+                            "is_group":   True,
+                        })
+                    else:
+                        prof      = await redis_client.hgetall(f"profile:{target_uid}")
+                        is_online = target_uid in active_connections
+                        last_seen = await redis_client.get(f"last_seen:{target_uid}")
+                        await _send_to(websocket, {
+                            "type":      "profile_response",
+                            "uid":       target_uid,
+                            "nickname":  prof.get("nickname", target_uid),
+                            "avatar_id": prof.get("avatar_id", ""),
+                            "status":    "online" if is_online else "offline",
+                            "last_seen": int(last_seen) if last_seen else 0,
+                        })
                 continue
 
             if msg_type == "check_statuses":
