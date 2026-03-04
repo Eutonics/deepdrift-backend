@@ -347,7 +347,8 @@ async def _route_message(target_uid: str, payload: dict, push_type: str, from_ui
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _assign_uid(websocket: WebSocket, uid: str):
-    """Финализирует подключение: регистрирует соединение, шлёт uid_assigned."""    async with _connections_lock:
+    """Финализирует подключение: регистрирует соединение, шлёт uid_assigned."""
+    async with _connections_lock:
         active_connections[uid] = websocket
     await _update_last_seen(uid)
     logger.info(f"✅ {uid} authenticated & connected (total: {len(active_connections)})")
