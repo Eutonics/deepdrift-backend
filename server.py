@@ -175,13 +175,16 @@ def _clean_rate_limit(uid: str):
 
 async def _validate_upload_token(token: str | None) -> bool:
     """Проверяет upload_token — выдаётся при подключении WebSocket.
-    Если Redis недоступен — пропускаем всех (деградация)."""
+    Если Redis недоступен или упал — пропускаем (деградация безопасна)."""
     if not redis_client:
         return True   # без Redis не можем проверить — разрешаем
     if not token:
         return False
-    uid = await redis_client.get(f"upload_token:{token}")
-    return uid is not None
+    try:
+        uid = await redis_client.get(f"upload_token:{token}")
+        return uid is not None
+    except Exception:
+        return True   # Redis недоступен в момент запроса — не блокируем пользователя
 
 async def _update_last_seen(uid: str):
     if redis_client:
@@ -671,6 +674,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         members.append(my_uid)
                     await redis_client.sadd(f"group:{group_id}", *members)
                     await redis_client.set(f"group_name:{group_id}", group_name)
+                    # Создатель — администратор группы
+                    await redis_client.sadd(f"group_admins:{group_id}", my_uid)
                     await _send_to(websocket, {"type": "group_created", "group_id": group_id})
                     # Уведомляем всех участников (включая офлайн — через очередь)
                     invite = {
@@ -703,12 +708,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     if str(target_uid).startswith("g_"):
                         group_name = await redis_client.get(f"group_name:{target_uid}") or target_uid
                         members    = list(await redis_client.smembers(f"group:{target_uid}"))
+                        admins     = list(await redis_client.smembers(f"group_admins:{target_uid}"))
                         await _send_to(websocket, {
                             "type":       "profile_response",
                             "uid":        target_uid,
                             "nickname":   group_name,
                             "group_name": group_name,
                             "members":    members,
+                            "admins":     admins,
+                            "is_admin":   my_uid in admins,
                             "is_group":   True,
                         })
                     else:
@@ -932,6 +940,58 @@ async def websocket_endpoint(websocket: WebSocket):
                         if member != my_uid and member in active_connections:
                             await _send_to(active_connections[member], leave_msg)
                     logger.info(f"👋 {my_uid} left group {group_id}")
+                continue
+
+            if msg_type == "kick_member":
+                # Выгнать участника — только admin может
+                group_id   = data.get("group_id")
+                target_uid = data.get("target_uid")
+                if redis_client and group_id and target_uid:
+                    admins = await redis_client.smembers(f"group_admins:{group_id}")
+                    if my_uid not in admins:
+                        await _send_to(websocket, {"type": "error", "message": "Not an admin"})
+                        continue
+                    await redis_client.srem(f"group:{group_id}", target_uid)
+                    await redis_client.delete(f"group_key:{group_id}:{target_uid}")
+                    # Уведомляем всех
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    kick_msg = {
+                        "type":       "group_member_kicked",
+                        "group_id":   group_id,
+                        "uid":        target_uid,
+                        "by_uid":     my_uid,
+                        "time":       _now_ms(),
+                    }
+                    if target_uid in active_connections:
+                        await _send_to(active_connections[target_uid], kick_msg)
+                    for member in members:
+                        if member in active_connections:
+                            await _send_to(active_connections[member], kick_msg)
+                    logger.info(f"🦵 {my_uid} kicked {target_uid} from group {group_id}")
+                continue
+
+            if msg_type == "promote_admin":
+                # Назначить участника администратором — только admin
+                group_id   = data.get("group_id")
+                target_uid = data.get("target_uid")
+                if redis_client and group_id and target_uid:
+                    admins = await redis_client.smembers(f"group_admins:{group_id}")
+                    if my_uid not in admins:
+                        await _send_to(websocket, {"type": "error", "message": "Not an admin"})
+                        continue
+                    await redis_client.sadd(f"group_admins:{group_id}", target_uid)
+                    notify = {
+                        "type":       "group_admin_promoted",
+                        "group_id":   group_id,
+                        "uid":        target_uid,
+                        "by_uid":     my_uid,
+                        "time":       _now_ms(),
+                    }
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    for member in members:
+                        if member in active_connections:
+                            await _send_to(active_connections[member], notify)
+                    logger.info(f"⭐ {my_uid} promoted {target_uid} in group {group_id}")
                 continue
 
             if msg_type == "ping":
