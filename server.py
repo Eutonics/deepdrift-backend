@@ -175,7 +175,8 @@ def _clean_rate_limit(uid: str):
 
 async def _validate_upload_token(token: str | None) -> bool:
     """Проверяет upload_token — выдаётся при подключении WebSocket.
-    Если Redis недоступен — пропускаем всех (деградация)."""    if not redis_client:
+    Если Redis недоступен — пропускаем всех (деградация)."""
+    if not redis_client:
         return True   # без Redis не можем проверить — разрешаем
     if not token:
         return False
