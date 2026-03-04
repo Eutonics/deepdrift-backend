@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime
 from typing import Dict, Optional
@@ -15,7 +16,7 @@ from botocore.config import Config
 import redis.asyncio as redis
 import firebase_admin
 from firebase_admin import credentials, messaging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -81,9 +82,18 @@ NONCE_SIZE_BYTES  = 32    # 256 бит случайности
 active_connections: Dict[str, WebSocket] = {}
 redis_client: Optional[redis.Redis]      = None
 
-_rate_limit: Dict[str, list] = {}
+_rate_limit: Dict[str, list] = {}   # fallback when Redis unavailable
 RATE_LIMIT_MAX    = 60
 RATE_LIMIT_WINDOW = 60
+
+# Лимит размера загружаемого файла: 150 МБ
+MAX_UPLOAD_SIZE = 150 * 1024 * 1024
+
+# TTL токена загрузки (привязан к сессии WebSocket)
+UPLOAD_TOKEN_TTL = 24 * 3600  # 24 часа
+
+# asyncio.Lock для atomic операций с active_connections
+_connections_lock = asyncio.Lock()
 
 # ─── Firebase ───────────────────────────────────────────────────────────────
 try:
@@ -129,7 +139,8 @@ def _now_ms() -> int:
 def _is_valid_uid(uid: str) -> bool:
     return bool(uid and UID_PATTERN.match(str(uid)))
 
-def _check_rate_limit(uid: str) -> bool:
+def _check_rate_limit_memory(uid: str) -> bool:
+    """Fallback rate limit — используется только когда Redis недоступен."""
     now = datetime.now().timestamp()
     timestamps = _rate_limit.get(uid, [])
     timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
@@ -139,8 +150,37 @@ def _check_rate_limit(uid: str) -> bool:
     _rate_limit[uid] = timestamps
     return True
 
+async def _check_rate_limit(uid: str) -> bool:
+    """Redis sliding-window rate limit (60 сообщений / 60 секунд).
+    Устойчив к горизонтальному масштабированию и рестарту сервера."""
+    if not redis_client:
+        return _check_rate_limit_memory(uid)
+    try:
+        now    = time.time()
+        key    = f"rate:{uid}"
+        cutoff = now - RATE_LIMIT_WINDOW
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.zremrangebyscore(key, 0, cutoff)
+            pipe.zadd(key, {str(now): now})
+            pipe.zcard(key)
+            pipe.expire(key, RATE_LIMIT_WINDOW)
+            results = await pipe.execute()
+        count = results[2]
+        return count <= RATE_LIMIT_MAX
+    except Exception:
+        return _check_rate_limit_memory(uid)
+
 def _clean_rate_limit(uid: str):
     _rate_limit.pop(uid, None)
+
+async def _validate_upload_token(token: str | None) -> bool:
+    """Проверяет upload_token — выдаётся при подключении WebSocket.
+    Если Redis недоступен — пропускаем всех (деградация)."""    if not redis_client:
+        return True   # без Redis не можем проверить — разрешаем
+    if not token:
+        return False
+    uid = await redis_client.get(f"upload_token:{token}")
+    return uid is not None
 
 async def _update_last_seen(uid: str):
     if redis_client:
@@ -239,15 +279,26 @@ async def _store_offline_message(target_uid: str, message_data: dict):
     if not redis_client:
         return
     try:
-        from_uid = message_data.get("from_uid", "unknown")
+        from_uid   = message_data.get("from_uid", "unknown")
+        message_id = message_data.get("id")
+        ttl        = 7 * 24 * 3600  # 7 дней
+
+        # ── Дедупликация по message_id ────────────────────────────────────────
+        # Предотвращает двойную очередь при повторных вызовах (сетевые ретраи и т.п.)
+        if message_id:
+            dedup_key = f"offline_id:{target_uid}:{message_id}"
+            if await redis_client.exists(dedup_key):
+                logger.debug(f"🔁 Dedup: skipping already-queued msg {message_id} for {target_uid}")
+                return
+            await redis_client.setex(dedup_key, ttl, "1")
 
         offline_key_global = f"offline_queue:{target_uid}"
         await redis_client.rpush(offline_key_global, json.dumps(message_data))
-        await redis_client.expire(offline_key_global, 7 * 24 * 3600)
+        await redis_client.expire(offline_key_global, ttl)
 
         offline_key_specific = f"offline:{target_uid}:from:{from_uid}"
         await redis_client.rpush(offline_key_specific, json.dumps(message_data))
-        await redis_client.expire(offline_key_specific, 7 * 24 * 3600)
+        await redis_client.expire(offline_key_specific, ttl)
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
@@ -295,11 +346,24 @@ async def _route_message(target_uid: str, payload: dict, push_type: str, from_ui
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _assign_uid(websocket: WebSocket, uid: str):
-    """Финализирует подключение: регистрирует соединение, шлёт uid_assigned."""
-    active_connections[uid] = websocket
+    """Финализирует подключение: регистрирует соединение, шлёт uid_assigned."""    async with _connections_lock:
+        active_connections[uid] = websocket
     await _update_last_seen(uid)
     logger.info(f"✅ {uid} authenticated & connected (total: {len(active_connections)})")
-    await _send_to(websocket, {"type": "uid_assigned", "my_uid": uid})
+
+    # Генерируем upload_token — клиент использует его для авторизации /upload и /download
+    upload_token = secrets.token_urlsafe(32)
+    if redis_client:
+        try:
+            await redis_client.setex(f"upload_token:{upload_token}", UPLOAD_TOKEN_TTL, uid)
+        except Exception:
+            pass
+
+    await _send_to(websocket, {
+        "type":         "uid_assigned",
+        "my_uid":       uid,
+        "upload_token": upload_token,
+    })
     asyncio.create_task(_send_offline_messages(websocket, uid))
 
 
@@ -452,12 +516,35 @@ async def root():
     }
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    # ── Авторизация ────────────────────────────────────────────────────────
+    token = request.headers.get("x-upload-token") or request.headers.get("X-Upload-Token")
+    if not await _validate_upload_token(token):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+
+    # ── Лимит размера: 150 МБ ─────────────────────────────────────────────
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_UPLOAD_SIZE:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=413,
+            content={"status": "error", "message": "File too large (max 150 MB)"},
+        )
+
     try:
         # Безопасное имя: uuid + оригинальное имя без директорий
         safe_name = os.path.basename(file.filename or "file")
         file_id   = f"{uuid.uuid4().hex}_{safe_name}"
         file_data = await file.read()
+
+        # Проверяем фактический размер после чтения (на случай отсутствия Content-Length)
+        if len(file_data) > MAX_UPLOAD_SIZE:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=413,
+                content={"status": "error", "message": "File too large (max 150 MB)"},
+            )
 
         if _r2:
             # ── Загружаем в Cloudflare R2 ────────────────────────────────────
@@ -484,10 +571,15 @@ async def upload_file(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 @app.get("/download/{file_id}")
-async def download_file(file_id: str):
+async def download_file(file_id: str, request: Request, token: str = None):
     from fastapi import Response
     from fastapi.responses import StreamingResponse
     import io
+
+    # Принимаем токен из query param (?token=...) или заголовка
+    auth_token = token or request.headers.get("x-upload-token") or request.headers.get("X-Upload-Token")
+    if not await _validate_upload_token(auth_token):
+        return Response(status_code=401, content="Unauthorized")
 
     safe_file_id = os.path.basename(file_id)
 
@@ -672,7 +764,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # ── СООБЩЕНИЯ ─────────────────────────────────────────────────────
             if msg_type == "message":
-                if not _check_rate_limit(my_uid):
+                if not await _check_rate_limit(my_uid):
                     continue
                 target_uid = data.get("target_uid")
                 message_id = data.get("id")
@@ -777,9 +869,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 group_id      = data.get("group_id")
                 encrypted_keys = data.get("encrypted_keys", {})  # {uid: encryptedBlob}
                 if redis_client and group_id and encrypted_keys:
+                    KEY_TTL = 90 * 24 * 3600  # 90 дней
                     for uid, blob in encrypted_keys.items():
                         key = f"group_key:{group_id}:{uid}"
-                        await redis_client.set(key, json.dumps({
+                        await redis_client.setex(key, KEY_TTL, json.dumps({
                             "blob":    blob,
                             "creator": my_uid,
                         }))
@@ -805,6 +898,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
                 continue
 
+            if msg_type == "leave_group":
+                group_id = data.get("group_id")
+                if redis_client and group_id:
+                    await redis_client.srem(f"group:{group_id}", my_uid)
+                    # Удаляем групповой ключ этого пользователя
+                    await redis_client.delete(f"group_key:{group_id}:{my_uid}")
+                    # Уведомляем оставшихся участников
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    leave_msg = {
+                        "type":     "group_member_left",
+                        "group_id": group_id,
+                        "uid":      my_uid,
+                        "time":     _now_ms(),
+                    }
+                    for member in members:
+                        if member != my_uid and member in active_connections:
+                            await _send_to(active_connections[member], leave_msg)
+                    logger.info(f"👋 {my_uid} left group {group_id}")
+                continue
+
             if msg_type == "ping":
                 await _send_to(websocket, {"type": "pong"})
                 continue
@@ -815,8 +928,9 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"❌ WebSocket loop error: {e}")
     finally:
         if my_uid:
-            if my_uid in active_connections and active_connections[my_uid] == websocket:
-                active_connections.pop(my_uid, None)
-                await _update_last_seen(my_uid)
-                logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
+            async with _connections_lock:
+                if my_uid in active_connections and active_connections[my_uid] == websocket:
+                    active_connections.pop(my_uid, None)
+            await _update_last_seen(my_uid)
+            logger.info(f"👋 {my_uid} disconnected (total: {len(active_connections)})")
             _clean_rate_limit(my_uid)
