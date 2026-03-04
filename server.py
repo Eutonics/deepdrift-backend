@@ -239,11 +239,15 @@ async def _store_offline_message(target_uid: str, message_data: dict):
     if not redis_client:
         return
     try:
+        from_uid = message_data.get("from_uid", "unknown")
 
         offline_key_global = f"offline_queue:{target_uid}"
         await redis_client.rpush(offline_key_global, json.dumps(message_data))
         await redis_client.expire(offline_key_global, 7 * 24 * 3600)
 
+        offline_key_specific = f"offline:{target_uid}:from:{from_uid}"
+        await redis_client.rpush(offline_key_specific, json.dumps(message_data))
+        await redis_client.expire(offline_key_specific, 7 * 24 * 3600)
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
@@ -574,8 +578,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     await redis_client.sadd(f"group:{group_id}", *members)
                     await redis_client.set(f"group_name:{group_id}", group_name)
                     await _send_to(websocket, {"type": "group_created", "group_id": group_id})
-                    # Уведомляем всех участников кроме создателя
-                    invite_payload = {
+                    # Уведомляем всех участников (включая офлайн — через очередь)
+                    invite = {
                         "type":       "group_invited",
                         "group_id":   group_id,
                         "group_name": group_name,
@@ -585,7 +589,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     for member_uid in members:
                         if member_uid == my_uid:
                             continue
-                        await _route_message(member_uid, invite_payload, "group_invited", my_uid)
+                        await _route_message(member_uid, invite, "group_invited", my_uid)
                 continue
 
             # ── ПРОФИЛЬ ───────────────────────────────────────────────────────
