@@ -795,6 +795,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not target_uid or not message_id:
                     continue
 
+                # ── Group admin restriction: only admins can post if enabled ──
+                if redis_client and str(target_uid).startswith("g_"):
+                    settings = await redis_client.hgetall(f"group_settings:{target_uid}")
+                    if settings.get("only_admins_post") == "1":
+                        admins = await redis_client.smembers(f"group_admins:{target_uid}")
+                        if my_uid not in admins:
+                            await _send_to(websocket, {"type": "error", "message": "Only admins can post in this group"})
+                            continue
+
                 raw_payload = {
                     "type":           "message",
                     "from_uid":       my_uid,
@@ -992,6 +1001,128 @@ async def websocket_endpoint(websocket: WebSocket):
                         if member in active_connections:
                             await _send_to(active_connections[member], notify)
                     logger.info(f"⭐ {my_uid} promoted {target_uid} in group {group_id}")
+                continue
+
+            # ── GROUP ADMIN SETTINGS ──────────────────────────────────────────
+            if msg_type == "update_group_settings":
+                group_id = data.get("group_id")
+                if redis_client and group_id:
+                    admins = await redis_client.smembers(f"group_admins:{group_id}")
+                    if my_uid not in admins:
+                        await _send_to(websocket, {"type": "error", "message": "Not an admin"})
+                        continue
+                    settings = {}
+                    if "only_admins_post" in data:
+                        settings["only_admins_post"] = "1" if data["only_admins_post"] else "0"
+                    if settings:
+                        await redis_client.hset(f"group_settings:{group_id}", mapping=settings)
+                    await _send_to(websocket, {"type": "group_settings_updated", "group_id": group_id})
+                    logger.info(f"⚙️ {my_uid} updated settings for {group_id}: {settings}")
+                continue
+
+            # ── CHANNELS ──────────────────────────────────────────────────────
+            if msg_type == "create_channel":
+                channel_id   = data.get("channel_id") or f"ch_{uuid.uuid4().hex[:8]}"
+                channel_name = data.get("channel_name", "").strip()
+                description  = data.get("description", "")
+                if redis_client and channel_name:
+                    meta = {
+                        "name":        channel_name,
+                        "owner_uid":   my_uid,
+                        "description": description,
+                        "created_at":  str(_now_ms()),
+                    }
+                    await redis_client.hset(f"channel:{channel_id}", mapping=meta)
+                    # Creator is auto-subscribed
+                    await redis_client.sadd(f"channel_subs:{channel_id}", my_uid)
+                    # Register in global search index (score = creation timestamp)
+                    await redis_client.zadd("channels_index", {channel_id: _now_ms()})
+                    await _send_to(websocket, {
+                        "type":         "channel_created",
+                        "channel_id":   channel_id,
+                        "channel_name": channel_name,
+                    })
+                    logger.info(f"📺 Channel created: {channel_id} ({channel_name}) by {my_uid}")
+                continue
+
+            if msg_type == "search_channels":
+                query = str(data.get("query", "")).lower().strip()
+                if redis_client:
+                    channel_ids = await redis_client.zrange("channels_index", 0, -1)
+                    results = []
+                    for cid in channel_ids:
+                        meta = await redis_client.hgetall(f"channel:{cid}")
+                        if not meta:
+                            continue
+                        if query and query not in meta.get("name", "").lower():
+                            continue
+                        sub_count = await redis_client.scard(f"channel_subs:{cid}")
+                        results.append({
+                            "channel_id":       cid,
+                            "channel_name":     meta.get("name"),
+                            "description":      meta.get("description", ""),
+                            "owner_uid":        meta.get("owner_uid"),
+                            "subscriber_count": sub_count,
+                        })
+                    await _send_to(websocket, {"type": "channel_search_results", "results": results})
+                continue
+
+            if msg_type == "join_channel":
+                channel_id = data.get("channel_id")
+                if redis_client and channel_id:
+                    exists = await redis_client.exists(f"channel:{channel_id}")
+                    if not exists:
+                        await _send_to(websocket, {"type": "error", "message": "Channel not found"})
+                    else:
+                        await redis_client.sadd(f"channel_subs:{channel_id}", my_uid)
+                        meta = await redis_client.hgetall(f"channel:{channel_id}")
+                        await _send_to(websocket, {
+                            "type":         "channel_joined",
+                            "channel_id":   channel_id,
+                            "channel_name": meta.get("name", channel_id),
+                        })
+                        logger.info(f"📺 {my_uid} joined channel {channel_id}")
+                continue
+
+            if msg_type == "leave_channel":
+                channel_id = data.get("channel_id")
+                if redis_client and channel_id:
+                    await redis_client.srem(f"channel_subs:{channel_id}", my_uid)
+                    await _send_to(websocket, {"type": "channel_left", "channel_id": channel_id})
+                    logger.info(f"📺 {my_uid} left channel {channel_id}")
+                continue
+
+            if msg_type == "channel_message":
+                channel_id = data.get("channel_id")
+                text       = data.get("text", "").strip()
+                message_id = data.get("id") or uuid.uuid4().hex
+                if redis_client and channel_id and text:
+                    meta = await redis_client.hgetall(f"channel:{channel_id}")
+                    if not meta:
+                        await _send_to(websocket, {"type": "error", "message": "Channel not found"})
+                        continue
+                    # Only the channel owner can post
+                    if meta.get("owner_uid") != my_uid:
+                        await _send_to(websocket, {"type": "error", "message": "Only the channel owner can post"})
+                        continue
+                    msg_payload = {
+                        "type":       "channel_message",
+                        "channel_id": channel_id,
+                        "from_uid":   my_uid,
+                        "id":         message_id,
+                        "text":       text,
+                        "time":       _now_ms(),
+                    }
+                    # Store in channel history (capped at 500 messages, newest first)
+                    await redis_client.lpush(f"channel_history:{channel_id}", json.dumps(msg_payload))
+                    await redis_client.ltrim(f"channel_history:{channel_id}", 0, 499)
+                    # Broadcast to all online subscribers
+                    subscribers = await redis_client.smembers(f"channel_subs:{channel_id}")
+                    for sub_uid in subscribers:
+                        if sub_uid != my_uid and sub_uid in active_connections:
+                            await _send_to(active_connections[sub_uid], msg_payload)
+                    await _send_to(websocket, {"type": "server_ack", "id": message_id, "delivered_online": True})
+                    logger.info(f"📺 Channel message in {channel_id} from {my_uid}")
                 continue
 
             if msg_type == "ping":
