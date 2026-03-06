@@ -225,13 +225,34 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         if group_id:
             data_payload["target_uid"] = group_id
 
+        # ── notification-payload позволяет Android показывать уведомление
+        # нативно, даже если приложение убито (не полагаясь на Dart-изолят).
+        # На iOS: badge + sound без раскрытия содержимого (E2E сохраняется).
         msg = messaging.Message(
             data=data_payload,
+            notification=messaging.Notification(
+                title="DDChat",
+                body="Новое зашифрованное сообщение",
+            ),
             token=token,
-            android=messaging.AndroidConfig(priority="high"),
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="chat_messages",
+                    priority=messaging.AndroidNotificationPriority.HIGH,
+                    default_vibrate_timings=True,
+                    default_sound=True,
+                ),
+            ),
             apns=messaging.APNSConfig(
-                headers={"apns-priority": "10", "apns-push-type": "background"},
-                payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)),
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        badge=1,
+                        sound="default",
+                        content_available=True,
+                    )
+                ),
             ),
         )
         await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
@@ -303,6 +324,16 @@ async def _store_offline_message(target_uid: str, message_data: dict):
         offline_key_specific = f"offline:{target_uid}:from:{from_uid}"
         await redis_client.rpush(offline_key_specific, json.dumps(message_data))
         await redis_client.expire(offline_key_specific, ttl)
+
+        # ── Группы: дублируем под ключом group_id ────────────────────────────
+        # Клиент вызывает requestOfflineMessages(groupId), сервер ищет по ключу
+        # offline:{member}:from:{group_id}. Без этой строки ключ никогда не совпадёт,
+        # и офлайн-сообщения группы не доставляются при входе в чат.
+        group_id = message_data.get("group_id")
+        if group_id and group_id != from_uid:
+            offline_key_group = f"offline:{target_uid}:from:{group_id}"
+            await redis_client.rpush(offline_key_group, json.dumps(message_data))
+            await redis_client.expire(offline_key_group, ttl)
     except Exception as e:
         logger.error(f"❌ Failed to store offline message: {e}")
 
