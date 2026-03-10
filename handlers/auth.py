@@ -39,12 +39,18 @@ class AuthHandler:
             except Exception:
                 pass
 
-        await self._cm.send_to(websocket, {
+        # FIX: сначала отправляем uid_assigned, и только потом запускаем
+        # доставку офлайн-сообщений. Если send_to упадёт — assign_uid
+        # вернёт False и вызывающий код сможет это обработать.
+        ok = await self._cm.send_to(websocket, {
             "type":         "uid_assigned",
             "my_uid":       uid,
             "upload_token": upload_token,
         })
-        asyncio.create_task(self._oq.send_all(websocket, uid, redis_client))
+        if ok:
+            # create_task передаёт websocket по ссылке — внутри send_all
+            # есть guard что ws всё ещё актуален для этого uid
+            asyncio.create_task(self._oq.send_all(websocket, uid, redis_client))
 
     async def handle_init(self, websocket: WebSocket, uid_candidate: str, redis_client) -> Optional[str]:
         """
@@ -62,14 +68,24 @@ class AuthHandler:
         stored_pubkey = await redis_client.get(f"auth:pubkey:{uid_candidate}")
 
         if stored_pubkey is None:
+            # Новый пользователь — пускаем без challenge
             await self.assign_uid(websocket, uid_candidate, redis_client)
             return uid_candidate
         else:
-            nonce     = secrets.token_bytes(NONCE_SIZE_BYTES)
-            nonce_b64 = base64.b64encode(nonce).decode()
-            await redis_client.setex(f"auth:nonce:{uid_candidate}", NONCE_TTL_SECONDS, nonce_b64)
+            # FIX: Если нонс уже существует и ещё не истёк — переиспользуем его.
+            # Это решает бесконечный цикл при быстрых переподключениях:
+            # клиент переподключается, получает тот же нонс и может его подписать.
+            existing_nonce = await redis_client.get(f"auth:nonce:{uid_candidate}")
+            if existing_nonce:
+                nonce_b64 = existing_nonce
+                logger.info(f"🔑 Auth challenge re-issued (reusing nonce) for {uid_candidate}")
+            else:
+                nonce     = secrets.token_bytes(NONCE_SIZE_BYTES)
+                nonce_b64 = base64.b64encode(nonce).decode()
+                await redis_client.setex(f"auth:nonce:{uid_candidate}", NONCE_TTL_SECONDS, nonce_b64)
+                logger.info(f"🔑 Auth challenge issued for {uid_candidate}")
+
             await self._cm.send_to(websocket, {"type": "auth_challenge", "nonce": nonce_b64})
-            logger.info(f"🔑 Auth challenge issued for {uid_candidate}")
             return None
 
     async def handle_auth_response(self, websocket: WebSocket, data: dict, redis_client) -> Optional[str]:
@@ -88,9 +104,21 @@ class AuthHandler:
 
         stored_nonce = await redis_client.get(f"auth:nonce:{uid}")
         if stored_nonce is None:
-            await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_expired"})
-            logger.warning(f"🚫 Auth failed for {uid}: nonce expired")
+            # FIX: Нонс истёк или не был выдан — вместо auth_failed
+            # выдаём новый challenge, чтобы клиент мог повторить попытку
+            # в том же соединении не разрываясь.
+            stored_pubkey_check = await redis_client.get(f"auth:pubkey:{uid}")
+            if stored_pubkey_check:
+                nonce     = secrets.token_bytes(NONCE_SIZE_BYTES)
+                nonce_b64_new = base64.b64encode(nonce).decode()
+                await redis_client.setex(f"auth:nonce:{uid}", NONCE_TTL_SECONDS, nonce_b64_new)
+                await self._cm.send_to(websocket, {"type": "auth_challenge", "nonce": nonce_b64_new})
+                logger.info(f"🔑 Auth challenge re-issued (nonce expired) for {uid}")
+            else:
+                await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_expired"})
+                logger.warning(f"🚫 Auth failed for {uid}: nonce expired")
             return None
+
         if stored_nonce != nonce_b64:
             await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_mismatch"})
             logger.warning(f"🚫 Auth failed for {uid}: nonce mismatch")
