@@ -41,23 +41,30 @@ class ConnectionManager:
 
     async def register(self, uid: str, ws: WebSocket):
         async with self._lock:
+            # Если было старое соединение — молча вытесняем его
             self._connections[uid] = ws
         logger.info(f"✅ {uid} connected (total: {self.online_count})")
 
     async def unregister(self, uid: str, ws: WebSocket):
         async with self._lock:
-            if uid in self._connections and self._connections[uid] == ws:
+            # Удаляем только если это именно тот WebSocket, который отключился.
+            # Защита от race condition: новое соединение могло уже зарегистрироваться
+            # под тем же uid до того как старое успело разрегистрироваться.
+            if uid in self._connections and self._connections[uid] is ws:
                 self._connections.pop(uid, None)
 
     async def send_to(self, ws: WebSocket, payload: dict) -> bool:
         """Отправляет JSON в WebSocket. Возвращает True при успехе."""
         try:
-            if ws.client_state.name != "CONNECTED":
+            # Проверяем оба состояния: клиентское и серверное
+            if ws.client_state.value != 1:  # WebSocketState.CONNECTED == 1
+                return False
+            if ws.application_state.value != 1:
                 return False
             await ws.send_text(json.dumps(payload))
             return True
         except Exception as e:
-            logger.warning(f"⚠️ Socket write error: {e}")
+            logger.warning(f"⚠️ Socket write error: {type(e).__name__}: {e}")
             return False
 
     async def deliver_to_uid(self, uid: str, payload: dict) -> bool:
@@ -73,7 +80,7 @@ class ConnectionManager:
             if not delivered:
                 logger.warning(f"🔌 Removing dead connection for {uid}")
                 async with self._lock:
-                    if uid in self._connections and self._connections[uid] == ws:
+                    if uid in self._connections and self._connections[uid] is ws:
                         del self._connections[uid]
                 # Попробуем через Pub/Sub — вдруг на другом инстансе
                 if self._redis_service and self._redis_service.available:
