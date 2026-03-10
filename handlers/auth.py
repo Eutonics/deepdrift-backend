@@ -134,7 +134,9 @@ class AuthHandler:
         try:
             pubkey_bytes = base64.b64decode(stored_pubkey_b64)
             sig_bytes    = base64.b64decode(sig_b64)
-            nonce_bytes  = base64.b64decode(nonce_b64)
+            # FIX: клиент подписывает UTF-8 байты строки nonce (base64-строку как текст),
+            # а не декодированные из base64 байты. Приводим проверку к тому же виду.
+            nonce_bytes  = nonce_b64.encode("utf-8")
 
             pubkey = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
             pubkey.verify(sig_bytes, nonce_bytes)
