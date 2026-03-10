@@ -2,23 +2,24 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Установка зависимостей системы
 RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем файл зависимостей
-COPY requirements_improved.txt requirements.txt
-
-# Устанавливаем Python зависимости
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код приложения
-COPY server_improved.py server.py
-COPY server_metrics.py server_metrics.py
+# Копируем весь проект (модульная структура)
+COPY config.py .
+COPY server.py .
+COPY server_metrics.py .
+COPY handlers/ handlers/
+COPY services/ services/
 
-# Открываем порт
 EXPOSE 8000
 
-# Запускаем приложение
+# Health-check для Docker
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
