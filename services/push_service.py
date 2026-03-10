@@ -57,14 +57,18 @@ class PushService:
             sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
             sender_name = sender_profile.get("nickname", from_uid) if sender_profile else from_uid
 
+            # FIX: target_uid всегда передаётся — клиент использует его чтобы
+            # запросить офлайн-очередь нужного чата при открытии по пушу.
+            # Для групп target_uid = group_id, для личных = from_uid.
+            chat_uid = group_id if group_id else from_uid
+
             data_payload = {
                 "from_uid":     from_uid,
+                "target_uid":   chat_uid,
                 "sender_name":  sender_name,
                 "type":         message_type,
                 "click_action": "FLUTTER_NOTIFICATION_CLICK",
             }
-            if group_id:
-                data_payload["target_uid"] = group_id
 
             msg = messaging.Message(
                 data=data_payload,
@@ -94,7 +98,7 @@ class PushService:
                 ),
             )
             await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
-            logger.info(f"📲 Push sent to {target_uid} ({message_type})")
+            logger.info(f"📲 Push sent to {target_uid} ({message_type}) from {from_uid}")
         except messaging.UnregisteredError:
             # Токен протух — удаляем из Redis, клиент перерегистрирует при следующем подключении
             logger.warning(f"⚠️ FCM token expired for {target_uid}, removing")
