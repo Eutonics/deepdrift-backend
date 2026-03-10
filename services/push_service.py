@@ -81,7 +81,8 @@ class PushService:
                     priority="high",
                     notification=messaging.AndroidNotification(
                         channel_id="chat_messages",
-                        priority=messaging.AndroidNotificationPriority.HIGH,
+                        # AndroidNotificationPriority не поддерживается в firebase-admin 6.x,
+                        # приоритет уже задан на уровне AndroidConfig через priority="high"
                         default_vibrate_timings=True,
                         default_sound=True,
                     ),
