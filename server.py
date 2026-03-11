@@ -228,28 +228,20 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         # ── notification-payload позволяет Android показывать уведомление
         # нативно, даже если приложение убито (не полагаясь на Dart-изолят).
         # На iOS: badge + sound без раскрытия содержимого (E2E сохраняется).
+        # Data-only push — Flutter обрабатывает его в background/foreground handler
+        # и показывает уведомление через FlutterLocalNotifications.
+        # Преимущество: onMessage срабатывает даже когда приложение свёрнуто,
+        # и мы полностью контролируем отображение (не дублируем системное + dart).
         msg = messaging.Message(
             data=data_payload,
-            notification=messaging.Notification(
-                title="DDChat",
-                body="Новое зашифрованное сообщение",
-            ),
             token=token,
             android=messaging.AndroidConfig(
                 priority="high",
-                notification=messaging.AndroidNotification(
-                    channel_id="chat_messages",
-                    # AndroidNotificationPriority не поддерживается в firebase-admin 6.x
-                    default_vibrate_timings=True,
-                    default_sound=True,
-                ),
             ),
             apns=messaging.APNSConfig(
                 headers={"apns-priority": "10"},
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
-                        badge=1,
-                        sound="default",
                         content_available=True,
                     )
                 ),
@@ -477,31 +469,20 @@ async def _handle_auth_response(websocket: WebSocket, data: dict) -> Optional[st
     try:
         pubkey_bytes = base64.b64decode(stored_pubkey_b64)
         sig_bytes    = base64.b64decode(sig_b64)
-        pubkey       = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+        nonce_bytes  = base64.b64decode(nonce_b64)
 
-        # Совместимость с разными версиями клиента:
-        # Новый Flutter подписывает base64.b64decode(nonce) — сырые байты.
-        # Старый Flutter подписывал nonce_b64.encode("utf-8") — строку как UTF-8.
-        # Пробуем оба варианта, чтобы не зависеть от версии клиента.
-        verified = False
-        for nonce_to_verify in [base64.b64decode(nonce_b64), nonce_b64.encode("utf-8")]:
-            try:
-                pubkey.verify(sig_bytes, nonce_to_verify)
-                verified = True
-                break
-            except InvalidSignature:
-                continue
-
-        if not verified:
-            await _send_to(websocket, {"type": "auth_failed", "reason": "invalid_signature"})
-            logger.warning(f"🚫 Auth failed for {uid}: invalid Ed25519 signature")
-            return None
+        pubkey = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+        pubkey.verify(sig_bytes, nonce_bytes)   # raises InvalidSignature if wrong
 
         await _assign_uid(websocket, uid)
         return uid
 
+    except InvalidSignature:
+        await _send_to(websocket, {"type": "auth_failed", "reason": "invalid_signature"})
+        logger.warning(f"🚫 Auth failed for {uid}: invalid Ed25519 signature")
+        return None
     except Exception as e:
-        await _send_to(websocket, {"type": "auth_failed", "reason": "verification_error"})
+        await _send_to(websocket, {"type": "auth_failed", "reason": f"verification_error"})
         logger.error(f"❌ Auth verification error for {uid}: {e}")
         return None
 
