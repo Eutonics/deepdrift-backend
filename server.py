@@ -477,20 +477,31 @@ async def _handle_auth_response(websocket: WebSocket, data: dict) -> Optional[st
     try:
         pubkey_bytes = base64.b64decode(stored_pubkey_b64)
         sig_bytes    = base64.b64decode(sig_b64)
-        nonce_bytes  = base64.b64decode(nonce_b64)
+        pubkey       = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
 
-        pubkey = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
-        pubkey.verify(sig_bytes, nonce_bytes)   # raises InvalidSignature if wrong
+        # Совместимость с разными версиями клиента:
+        # Новый Flutter подписывает base64.b64decode(nonce) — сырые байты.
+        # Старый Flutter подписывал nonce_b64.encode("utf-8") — строку как UTF-8.
+        # Пробуем оба варианта, чтобы не зависеть от версии клиента.
+        verified = False
+        for nonce_to_verify in [base64.b64decode(nonce_b64), nonce_b64.encode("utf-8")]:
+            try:
+                pubkey.verify(sig_bytes, nonce_to_verify)
+                verified = True
+                break
+            except InvalidSignature:
+                continue
+
+        if not verified:
+            await _send_to(websocket, {"type": "auth_failed", "reason": "invalid_signature"})
+            logger.warning(f"🚫 Auth failed for {uid}: invalid Ed25519 signature")
+            return None
 
         await _assign_uid(websocket, uid)
         return uid
 
-    except InvalidSignature:
-        await _send_to(websocket, {"type": "auth_failed", "reason": "invalid_signature"})
-        logger.warning(f"🚫 Auth failed for {uid}: invalid Ed25519 signature")
-        return None
     except Exception as e:
-        await _send_to(websocket, {"type": "auth_failed", "reason": f"verification_error"})
+        await _send_to(websocket, {"type": "auth_failed", "reason": "verification_error"})
         logger.error(f"❌ Auth verification error for {uid}: {e}")
         return None
 
