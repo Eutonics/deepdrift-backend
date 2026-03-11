@@ -1,5 +1,7 @@
 """
 Аутентификация: Challenge-Response через Ed25519.
+Верификация: сервер декодирует nonce из base64 и проверяет подпись над raw байтами.
+Клиент (signChallenge): base64Decode(nonce) → sign raw байты → base64Encode(sig).
 """
 import asyncio
 import base64
@@ -31,7 +33,6 @@ class AuthHandler:
         await self._update_last_seen(uid, redis_client)
         logger.info(f"✅ {uid} authenticated & connected (total: {self._cm.online_count})")
 
-        # Генерируем upload_token
         upload_token = secrets.token_urlsafe(32)
         if redis_client:
             try:
@@ -39,24 +40,15 @@ class AuthHandler:
             except Exception:
                 pass
 
-        # FIX: сначала отправляем uid_assigned, и только потом запускаем
-        # доставку офлайн-сообщений. Если send_to упадёт — assign_uid
-        # вернёт False и вызывающий код сможет это обработать.
         ok = await self._cm.send_to(websocket, {
             "type":         "uid_assigned",
             "my_uid":       uid,
             "upload_token": upload_token,
         })
         if ok:
-            # create_task передаёт websocket по ссылке — внутри send_all
-            # есть guard что ws всё ещё актуален для этого uid
             asyncio.create_task(self._oq.send_all(websocket, uid, redis_client))
 
     async def handle_init(self, websocket: WebSocket, uid_candidate: str, redis_client) -> Optional[str]:
-        """
-        Обрабатывает init.
-        Возвращает uid если аутентификация прошла сразу, None если нужен challenge.
-        """
         if not self.is_valid_uid(uid_candidate):
             await self._cm.send_to(websocket, {"type": "error", "message": "Invalid UID format (6 digits required)"})
             return None
@@ -68,13 +60,11 @@ class AuthHandler:
         stored_pubkey = await redis_client.get(f"auth:pubkey:{uid_candidate}")
 
         if stored_pubkey is None:
-            # Новый пользователь — пускаем без challenge
             await self.assign_uid(websocket, uid_candidate, redis_client)
             return uid_candidate
         else:
-            # FIX: Если нонс уже существует и ещё не истёк — переиспользуем его.
-            # Это решает бесконечный цикл при быстрых переподключениях:
-            # клиент переподключается, получает тот же нонс и может его подписать.
+            # Reuse existing nonce if not expired — решает бесконечный цикл при
+            # быстрых переподключениях: клиент успеет ответить тем же nonce.
             existing_nonce = await redis_client.get(f"auth:nonce:{uid_candidate}")
             if existing_nonce:
                 nonce_b64 = existing_nonce
@@ -89,7 +79,6 @@ class AuthHandler:
             return None
 
     async def handle_auth_response(self, websocket: WebSocket, data: dict, redis_client) -> Optional[str]:
-        """Проверяет подпись нонса. Возвращает uid при успехе."""
         uid       = str(data.get("uid", "")).strip()
         nonce_b64 = data.get("nonce")
         sig_b64   = data.get("signature")
@@ -104,21 +93,9 @@ class AuthHandler:
 
         stored_nonce = await redis_client.get(f"auth:nonce:{uid}")
         if stored_nonce is None:
-            # FIX: Нонс истёк или не был выдан — вместо auth_failed
-            # выдаём новый challenge, чтобы клиент мог повторить попытку
-            # в том же соединении не разрываясь.
-            stored_pubkey_check = await redis_client.get(f"auth:pubkey:{uid}")
-            if stored_pubkey_check:
-                nonce     = secrets.token_bytes(NONCE_SIZE_BYTES)
-                nonce_b64_new = base64.b64encode(nonce).decode()
-                await redis_client.setex(f"auth:nonce:{uid}", NONCE_TTL_SECONDS, nonce_b64_new)
-                await self._cm.send_to(websocket, {"type": "auth_challenge", "nonce": nonce_b64_new})
-                logger.info(f"🔑 Auth challenge re-issued (nonce expired) for {uid}")
-            else:
-                await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_expired"})
-                logger.warning(f"🚫 Auth failed for {uid}: nonce expired")
+            await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_expired"})
+            logger.warning(f"🚫 Auth failed for {uid}: nonce expired")
             return None
-
         if stored_nonce != nonce_b64:
             await self._cm.send_to(websocket, {"type": "auth_failed", "reason": "nonce_mismatch"})
             logger.warning(f"🚫 Auth failed for {uid}: nonce mismatch")
@@ -134,9 +111,7 @@ class AuthHandler:
         try:
             pubkey_bytes = base64.b64decode(stored_pubkey_b64)
             sig_bytes    = base64.b64decode(sig_b64)
-            # FIX: клиент подписывает UTF-8 байты строки nonce (base64-строку как текст),
-            # а не декодированные из base64 байты. Приводим проверку к тому же виду.
-            nonce_bytes  = nonce_b64.encode("utf-8")
+            nonce_bytes  = base64.b64decode(nonce_b64)  # клиент подписывает raw байты
 
             pubkey = Ed25519PublicKey.from_public_bytes(pubkey_bytes)
             pubkey.verify(sig_bytes, nonce_bytes)
@@ -154,7 +129,6 @@ class AuthHandler:
             return None
 
     async def handle_register(self, websocket: WebSocket, uid: str, data: dict, redis_client):
-        """Привязывает Ed25519 pubkey к uid."""
         pubkey_b64 = data.get("ed25519_pubkey")
 
         if not pubkey_b64:
@@ -199,16 +173,12 @@ class AuthHandler:
 
     @staticmethod
     async def validate_upload_token(token: str | None, redis_client) -> bool:
-        """
-        Проверяет upload_token.
-        SECURITY FIX: возвращает False если Redis недоступен (вместо True).
-        """
         if not redis_client:
-            return False  # Без Redis не можем проверить — блокируем
+            return False
         if not token:
             return False
         try:
             uid = await redis_client.get(f"upload_token:{token}")
             return uid is not None
         except Exception:
-            return False  # Redis недоступен — блокируем для безопасности
+            return False
