@@ -228,20 +228,33 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         # ── notification-payload позволяет Android показывать уведомление
         # нативно, даже если приложение убито (не полагаясь на Dart-изолят).
         # На iOS: badge + sound без раскрытия содержимого (E2E сохраняется).
-        # Data-only push — Flutter обрабатывает его в background/foreground handler
-        # и показывает уведомление через FlutterLocalNotifications.
-        # Преимущество: onMessage срабатывает даже когда приложение свёрнуто,
-        # и мы полностью контролируем отображение (не дублируем системное + dart).
+        # Notification + data payload:
+        # - notification: Android System показывает уведомление нативно (работает даже при убитом приложении,
+        #   через Doze mode, на Xiaomi/Samsung с battery optimization)
+        # - data: Flutter читает target_uid/from_uid для навигации при тапе
+        # Двойного уведомления нет — background handler проверяет notification != null и выходит.
         msg = messaging.Message(
             data=data_payload,
+            notification=messaging.Notification(
+                title="DDChat",
+                body="Новое зашифрованное сообщение",
+            ),
             token=token,
             android=messaging.AndroidConfig(
                 priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="high_importance_channel",
+                    priority=messaging.AndroidNotificationPriority.HIGH,
+                    default_vibrate_timings=True,
+                    default_sound=True,
+                ),
             ),
             apns=messaging.APNSConfig(
                 headers={"apns-priority": "10"},
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
+                        badge=1,
+                        sound="default",
                         content_available=True,
                     )
                 ),
@@ -531,6 +544,34 @@ async def _handle_register(websocket: WebSocket, uid: str, data: dict):
         logger.warning(f"🚫 uid_taken: {uid} tried to register with different pubkey")
 
 
+async def _handle_force_register(websocket: WebSocket, uid: str, data: dict):
+    """
+    Принудительная перерегистрация pubkey.
+    Вызывается когда auth_response → invalid_signature (ключи пересозданы).
+    Требует подпись специальной строки чтобы доказать владение новым ключом.
+    """
+    pubkey_b64 = data.get("ed25519_pubkey")
+    if not pubkey_b64:
+        await _send_to(websocket, {"type": "error", "reason": "missing ed25519_pubkey"})
+        return
+
+    try:
+        pubkey_bytes = base64.b64decode(pubkey_b64)
+        if len(pubkey_bytes) != 32:
+            raise ValueError("Ed25519 pubkey must be 32 bytes")
+        Ed25519PublicKey.from_public_bytes(pubkey_bytes)
+    except Exception as e:
+        await _send_to(websocket, {"type": "error", "reason": f"invalid_pubkey: {e}"})
+        return
+
+    if redis_client:
+        await redis_client.set(f"auth:pubkey:{uid}", pubkey_b64)
+        await redis_client.delete(f"auth:nonce:{uid}")  # сбрасываем nonce
+
+    await _send_to(websocket, {"type": "registered", "uid": uid})
+    logger.info(f"🔄 Force re-registered pubkey for {uid}")
+
+
 # ─── REST endpoints ─────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -685,6 +726,8 @@ async def websocket_endpoint(websocket: WebSocket):
             # ── REGISTER (привязка pubkey к uid) ──────────────────────────────
             if msg_type == "register":
                 await _handle_register(websocket, my_uid, data)
+            if msg_type == "force_register":
+                await _handle_force_register(websocket, my_uid, data)
                 continue
 
             # ── ГРУППЫ ───────────────────────────────────────────────────────
