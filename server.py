@@ -252,6 +252,7 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
     try:
         token = await redis_client.get(f"fcm_token:{target_uid}")
         if not token:
+            logger.warning(f"⚠️ No FCM token for {target_uid} — push skipped")
             return
 
         sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
@@ -829,17 +830,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         members.append(my_uid)
                     await redis_client.sadd(f"group:{group_id}", *members)
                     await redis_client.set(f"group_name:{group_id}", group_name)
-                    # Создатель — администратор группы
                     await redis_client.sadd(f"group_admins:{group_id}", my_uid)
+                    # Генерируем групповой ключ на сервере — 32 случайных байта
+                    group_key = secrets.token_bytes(32)
+                    import base64 as _b64
+                    group_key_b64 = _b64.b64encode(group_key).decode()
+                    await redis_client.set(f"group_key:{group_id}", group_key_b64)
+                    logger.info(f"🔑 Group key generated for {group_id}")
                     await _send_to(websocket, {"type": "group_created", "group_id": group_id})
-                    # Уведомляем всех участников (включая офлайн — через очередь)
                     invite = {
-                        "type":       "group_invited",
-                        "group_id":   group_id,
-                        "group_name": group_name,
+                        "type":        "group_invited",
+                        "group_id":    group_id,
+                        "group_name":  group_name,
                         "creator_uid": my_uid,
-                        "from_uid":   my_uid,
-                        "members":    members,
+                        "from_uid":    my_uid,
+                        "members":     members,
                     }
                     for member_uid in members:
                         if member_uid == my_uid:
@@ -851,8 +856,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "add_member":
                 group_id      = data.get("group_id")
                 new_member    = data.get("new_member_uid")
-                encrypted_key = data.get("encrypted_key")
-                if not (redis_client and group_id and new_member and encrypted_key):
+                if not (redis_client and group_id and new_member):
                     continue
                 # Проверяем что запрашивающий — участник/admin группы
                 is_member = await redis_client.sismember(f"group:{group_id}", my_uid)
@@ -861,13 +865,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 # Добавляем в группу
                 await redis_client.sadd(f"group:{group_id}", new_member)
-                # Сохраняем зашифрованный ключ для нового участника (от создателя)
-                KEY_TTL = 90 * 24 * 3600
-                await redis_client.setex(
-                    f"group_key:{group_id}:{new_member}",
-                    KEY_TTL,
-                    json.dumps({"blob": encrypted_key, "creator": my_uid})
-                )
                 group_name = await redis_client.get(f"group_name:{group_id}") or group_id
                 members    = list(await redis_client.smembers(f"group:{group_id}"))
                 # Уведомляем нового участника — приглашение с данными группы
@@ -962,6 +959,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 token = data.get("fcm_token")
                 if redis_client and token:
                     await redis_client.set(f"fcm_token:{my_uid}", token)
+                    logger.info(f"📱 FCM token saved for {my_uid} ({token[:20]}...)")
+                else:
+                    logger.warning(f"⚠️ register_fcm_token: no token in payload for {my_uid}")
                 continue
 
             # ── ПУБЛИЧНЫЕ КЛЮЧИ (для E2E шифрования, не для auth) ─────────────
@@ -1100,46 +1100,35 @@ async def websocket_endpoint(websocket: WebSocket):
             # Создатель шлёт зашифрованные копии группового ключа для каждого участника.
             # Сервер хранит их в Redis; каждый участник получает только свою копию.
             if msg_type == "distribute_group_keys":
-                group_id      = data.get("group_id")
-                encrypted_keys = data.get("encrypted_keys", {})  # {uid: encryptedBlob}
-                if redis_client and group_id and encrypted_keys:
-                    KEY_TTL = 90 * 24 * 3600  # 90 дней
-                    for uid, blob in encrypted_keys.items():
-                        key = f"group_key:{group_id}:{uid}"
-                        await redis_client.setex(key, KEY_TTL, json.dumps({
-                            "blob":    blob,
-                            "creator": my_uid,
-                        }))
-                    logger.info(f"🔑 Group keys stored for {group_id} ({len(encrypted_keys)} members)")
+                # Упрощённая схема: ключ хранится на сервере, distribute больше не нужен
                 continue
 
             if msg_type == "get_group_key":
                 group_id = data.get("group_id")
                 if redis_client and group_id:
-                    raw = await redis_client.get(f"group_key:{group_id}:{my_uid}")
-                    if raw:
-                        entry = json.loads(raw)
+                    # Проверяем что запрашивающий — участник группы
+                    is_member = await redis_client.sismember(f"group:{group_id}", my_uid)
+                    if not is_member:
+                        await _send_to(websocket, {"type": "error", "message": "Not a group member"})
+                        continue
+                    key_b64 = await redis_client.get(f"group_key:{group_id}")
+                    if key_b64:
                         await _send_to(websocket, {
-                            "type":          "group_key_response",
-                            "group_id":      group_id,
-                            "encrypted_key": entry.get("blob"),
-                            "creator_uid":   entry.get("creator"),
+                            "type":      "group_key_response",
+                            "group_id":  group_id,
+                            "group_key": key_b64,
                         })
                     else:
+                        # Ключ потерян (Redis перезапущен?) — генерируем новый
+                        import base64 as _b64
+                        new_key = _b64.b64encode(secrets.token_bytes(32)).decode()
+                        await redis_client.set(f"group_key:{group_id}", new_key)
+                        logger.warning(f"⚠️ Group key regenerated for {group_id}")
                         await _send_to(websocket, {
-                            "type":     "group_key_not_found",
-                            "group_id": group_id,
+                            "type":      "group_key_response",
+                            "group_id":  group_id,
+                            "group_key": new_key,
                         })
-                        # Уведомляем создателя группы (первый admin) чтобы переслал ключ
-                        admins = await redis_client.smembers(f"group_admins:{group_id}")
-                        creator = next(iter(admins), None) if admins else None
-                        if creator and creator in active_connections and creator != my_uid:
-                            await _send_to(active_connections[creator], {
-                                "type":          "redistribute_group_key",
-                                "group_id":      group_id,
-                                "request_uid":   my_uid,
-                            })
-                            logger.info(f"🔑 Asked {creator} to re-distribute key for {group_id} to {my_uid}")
                 continue
 
             if msg_type == "leave_group":
