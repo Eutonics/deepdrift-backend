@@ -847,6 +847,52 @@ async def websocket_endpoint(websocket: WebSocket):
                         await _route_message(member_uid, invite, "group_invited", my_uid)
                 continue
 
+
+            if msg_type == "add_member":
+                group_id      = data.get("group_id")
+                new_member    = data.get("new_member_uid")
+                encrypted_key = data.get("encrypted_key")
+                if not (redis_client and group_id and new_member and encrypted_key):
+                    continue
+                # Проверяем что запрашивающий — участник/admin группы
+                is_member = await redis_client.sismember(f"group:{group_id}", my_uid)
+                if not is_member:
+                    await _send_to(websocket, {"type": "error", "message": "Not a group member"})
+                    continue
+                # Добавляем в группу
+                await redis_client.sadd(f"group:{group_id}", new_member)
+                # Сохраняем зашифрованный ключ для нового участника (от создателя)
+                KEY_TTL = 90 * 24 * 3600
+                await redis_client.setex(
+                    f"group_key:{group_id}:{new_member}",
+                    KEY_TTL,
+                    json.dumps({"blob": encrypted_key, "creator": my_uid})
+                )
+                group_name = await redis_client.get(f"group_name:{group_id}") or group_id
+                members    = list(await redis_client.smembers(f"group:{group_id}"))
+                # Уведомляем нового участника — приглашение с данными группы
+                invite = {
+                    "type":        "group_invited",
+                    "group_id":    group_id,
+                    "group_name":  group_name,
+                    "creator_uid": my_uid,
+                    "from_uid":    my_uid,
+                    "members":     members,
+                }
+                await _route_message(new_member, invite, "group_invited", my_uid)
+                # Уведомляем остальных участников о новом члене
+                member_added_msg = {
+                    "type":     "group_member_added",
+                    "group_id": group_id,
+                    "new_uid":  new_member,
+                    "added_by": my_uid,
+                }
+                for member in members:
+                    if member != my_uid and member != new_member and member in active_connections:
+                        await _send_to(active_connections[member], member_added_msg)
+                logger.info(f"👤 {new_member} added to {group_id} by {my_uid}")
+                continue
+
             # ── ПРОФИЛЬ ───────────────────────────────────────────────────────
             if msg_type == "update_profile":
                 nickname  = data.get("nickname") or ""
@@ -1084,6 +1130,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type":     "group_key_not_found",
                             "group_id": group_id,
                         })
+                        # Уведомляем создателя группы (первый admin) чтобы переслал ключ
+                        admins = await redis_client.smembers(f"group_admins:{group_id}")
+                        creator = next(iter(admins), None) if admins else None
+                        if creator and creator in active_connections and creator != my_uid:
+                            await _send_to(active_connections[creator], {
+                                "type":          "redistribute_group_key",
+                                "group_id":      group_id,
+                                "request_uid":   my_uid,
+                            })
+                            logger.info(f"🔑 Asked {creator} to re-distribute key for {group_id} to {my_uid}")
                 continue
 
             if msg_type == "leave_group":
