@@ -46,6 +46,7 @@ R2_ENDPOINT  = os.environ.get("R2_ENDPOINT_URL", "")
 R2_KEY_ID    = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET    = os.environ.get("R2_SECRET_KEY", "")
 R2_BUCKET    = os.environ.get("R2_BUCKET_NAME", "ddchat-files")
+FILE_TTL_DAYS = int(os.environ.get("FILE_TTL_DAYS", "7"))  # удалять файлы старше N дней
 
 # Fallback: локальная папка если R2 не настроен (не пропадёт при рестарте, но и не надёжно)
 UPLOAD_DIR = "uploads"
@@ -128,9 +129,49 @@ async def init_redis():
         logger.error(f"❌ Redis Connection Failed: {e}")
         redis_client = None
 
+
+# ─── Автоудаление старых файлов из R2 ───────────────────────────────────────
+
+async def _cleanup_old_files():
+    """Удаляет файлы из R2 старше FILE_TTL_DAYS дней. Запускается каждые 6 часов."""
+    while True:
+        await asyncio.sleep(6 * 3600)
+        if not _r2 or not redis_client:
+            continue
+        try:
+            cutoff = datetime.now().timestamp() - FILE_TTL_DAYS * 86400
+            # Берём все file_id загруженные до cutoff
+            old_files = await redis_client.zrangebyscore("r2:files", 0, cutoff)
+            if not old_files:
+                continue
+
+            deleted = 0
+            errors  = 0
+            for file_id in old_files:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda fid=file_id: _r2.delete_object(Bucket=R2_BUCKET, Key=fid)
+                    )
+                    await redis_client.zrem("r2:files", file_id)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to delete {file_id}: {e}")
+                    errors += 1
+
+            logger.info(
+                f"🧹 File cleanup: deleted {deleted}, errors {errors} "
+                f"(TTL={FILE_TTL_DAYS}d, cutoff={datetime.fromtimestamp(cutoff).strftime('%Y-%m-%d')})"
+            )
+        except Exception as e:
+            logger.error(f"❌ Cleanup task error: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     await init_redis()
+    # Запускаем фоновую задачу автоудаления файлов
+    asyncio.create_task(_cleanup_old_files())
+    logger.info(f"🧹 File auto-cleanup enabled: TTL={FILE_TTL_DAYS} days, runs every 6h")
 
 # ─── Хелперы ────────────────────────────────────────────────────────────────
 def _now_ms() -> int:
@@ -244,7 +285,6 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
                 priority="high",
                 notification=messaging.AndroidNotification(
                     channel_id="high_importance_channel",
-                    priority=messaging.AndroidNotificationPriority.HIGH,
                     default_vibrate_timings=True,
                     default_sound=True,
                 ),
@@ -270,6 +310,11 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
     if not redis_client:
         return
     await asyncio.sleep(0.5)
+    # Guard: если за время sleep подключился новый сокет — не доставляем в старый
+    async with _connections_lock:
+        current_ws = active_connections.get(my_uid)
+    if current_ws is not websocket:
+        return
     try:
         offline_key = f"offline_queue:{my_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
@@ -277,6 +322,11 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
             logger.info(f"📬 Sending {len(messages)} global offline messages to {my_uid}")
             success_count = 0
             for msg_json in messages:
+                # Проверяем перед каждым сообщением — не вытеснили ли нас
+                async with _connections_lock:
+                    current_ws = active_connections.get(my_uid)
+                if current_ws is not websocket:
+                    break
                 if await _send_to(websocket, json.loads(msg_json)):
                     success_count += 1
                 else:
@@ -289,6 +339,11 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
 async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_uid: str):
     if not redis_client:
         return
+    # Guard: только если этот websocket всё ещё активный
+    async with _connections_lock:
+        current_ws = active_connections.get(my_uid)
+    if current_ws is not websocket:
+        return
     try:
         offline_key = f"offline:{my_uid}:from:{from_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
@@ -296,6 +351,10 @@ async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_ui
             logger.info(f"📬 Sending {len(messages)} messages from {from_uid} to {my_uid}")
             success_count = 0
             for msg_json in messages:
+                async with _connections_lock:
+                    current_ws = active_connections.get(my_uid)
+                if current_ws is not websocket:
+                    break
                 if await _send_to(websocket, json.loads(msg_json)):
                     success_count += 1
                 else:
@@ -387,6 +446,10 @@ async def _route_message(target_uid: str, payload: dict, push_type: str, from_ui
 
 async def _assign_uid(websocket: WebSocket, uid: str):
     """Финализирует подключение: регистрирует соединение, шлёт uid_assigned."""
+    # Проверяем что websocket ещё жив перед регистрацией
+    if websocket.client_state.name != "CONNECTED":
+        logger.warning(f"⚠️ Skipping _assign_uid for {uid}: websocket already closed")
+        return
     async with _connections_lock:
         active_connections[uid] = websocket
     await _update_last_seen(uid)
@@ -627,6 +690,12 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 ),
             )
             logger.info(f"📦 Uploaded to R2: {file_id} ({len(file_data)} bytes)")
+            # Регистрируем файл в Redis для автоудаления
+            if redis_client:
+                await redis_client.zadd(
+                    "r2:files",
+                    {file_id: datetime.now().timestamp()}
+                )
         else:
             # ── Fallback: локальный диск ──────────────────────────────────────
             file_path = os.path.join(UPLOAD_DIR, file_id)
@@ -683,6 +752,26 @@ async def download_file(file_id: str, request: Request, token: str = None):
 
 
 # ─── WebSocket ──────────────────────────────────────────────────────────────
+
+@app.get("/storage/stats")
+async def storage_stats(request: Request):
+    """Статистика файлового хранилища (публичный endpoint для мониторинга)."""
+    result = {
+        "ttl_days":    FILE_TTL_DAYS,
+        "bucket":      R2_BUCKET,
+        "r2_connected": bool(_r2),
+    }
+    if redis_client:
+        try:
+            total  = await redis_client.zcard("r2:files")
+            cutoff = datetime.now().timestamp() - FILE_TTL_DAYS * 86400
+            old    = await redis_client.zcount("r2:files", 0, cutoff)
+            result["tracked_files"] = total
+            result["pending_deletion"] = old
+        except Exception:
+            pass
+    return result
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
