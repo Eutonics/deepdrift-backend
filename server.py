@@ -333,7 +333,16 @@ async def _send_offline_messages(websocket: WebSocket, my_uid: str):
                 else:
                     break
             if success_count > 0:
-                await redis_client.ltrim(offline_key, success_count, -1)
+                # ── FIX: повторная проверка перед trim ──────────────────────
+                # Между последним _send_to и ltrim сокет мог умереть.
+                # Если это так — не удаляем сообщения, они доставятся
+                # при следующем подключении.
+                async with _connections_lock:
+                    current_ws = active_connections.get(my_uid)
+                if current_ws is websocket:
+                    await redis_client.ltrim(offline_key, success_count, -1)
+                else:
+                    logger.info(f"⚠️ Skipping offline trim for {my_uid}: connection changed")
     except Exception as e:
         logger.error(f"❌ Error sending offline messages: {e}")
 
@@ -361,7 +370,13 @@ async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_ui
                 else:
                     break
             if success_count > 0:
-                await redis_client.ltrim(offline_key, success_count, -1)
+                # ── FIX: повторная проверка перед trim ──────────────────────
+                async with _connections_lock:
+                    current_ws = active_connections.get(my_uid)
+                if current_ws is websocket:
+                    await redis_client.ltrim(offline_key, success_count, -1)
+                else:
+                    logger.info(f"⚠️ Skipping specific offline trim for {my_uid}: connection changed")
     except Exception as e:
         logger.error(f"❌ Error sending specific offline messages: {e}")
 
@@ -404,16 +419,25 @@ async def _store_offline_message(target_uid: str, message_data: dict):
 
 # ─── Роутинг ────────────────────────────────────────────────────────────────
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str, group_id: str = None):
+    # ── FIX: ВСЕГДА сохраняем в офлайн-очередь как страховку ─────────────
+    # Проблема: _send_to() может вернуть True (TCP-буфер принял), но клиент
+    # уже отключается — сообщение теряется. Сохранение "на всякий случай"
+    # гарантирует доставку при следующем connect. Клиент дедуплицирует по msgId.
+    # Дедупликация в _store_offline_message (по offline_id:{uid}:{msgId})
+    # предотвращает дублирование записей при повторных вызовах.
+    await _store_offline_message(target_uid, payload)
+
     delivered = False
     if target_uid in active_connections:
         ws = active_connections[target_uid]
         delivered = await _send_to(ws, payload)
         if not delivered:
             logger.warning(f"🔌 Removing dead connection for {target_uid}")
-            del active_connections[target_uid]
+            async with _connections_lock:
+                if target_uid in active_connections and active_connections[target_uid] is ws:
+                    del active_connections[target_uid]
 
     if not delivered:
-        await _store_offline_message(target_uid, payload)
         await _send_fcm_push(target_uid, from_uid, push_type, group_id)
 
     return delivered
