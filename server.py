@@ -715,10 +715,8 @@ async def download_file(file_id: str, request: Request, token: str = None):
     from fastapi.responses import StreamingResponse
     import io
 
-    # Принимаем токен из query param (?token=...) или заголовка
-    auth_token = token or request.headers.get("x-upload-token") or request.headers.get("X-Upload-Token")
-    if not await _validate_upload_token(auth_token):
-        return Response(status_code=401, content="Unauthorized")
+    # Файлы зашифрованы E2E на клиенте — авторизация на скачивание не нужна.
+    # Без токена получатель всё равно не сможет расшифровать чужой файл.
 
     safe_file_id = os.path.basename(file_id)
 
