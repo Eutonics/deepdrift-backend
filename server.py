@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 import boto3
@@ -305,6 +305,62 @@ async def _send_fcm_push(target_uid: str, from_uid: str, message_type: str = "ne
         logger.info(f"📲 Push sent to {target_uid} ({message_type})")
     except Exception as e:
         logger.error(f"❌ Push error: {e}")
+
+async def _send_fcm_call_push(target_uid: str, from_uid: str, call_id: str, call_type: str = "audio"):
+    """Отправляет высокоприоритетный push для входящего вызова."""
+    if not redis_client or not firebase_admin._apps:
+        return
+    try:
+        token = await redis_client.get(f"fcm_token:{target_uid}")
+        if not token:
+            logger.warning(f"⚠️ No FCM token for {target_uid} — call push skipped")
+            return
+
+        sender_profile = await redis_client.hgetall(f"profile:{from_uid}")
+        sender_name = sender_profile.get("nickname", from_uid) if sender_profile else from_uid
+
+        data_payload = {
+            "from_uid":     from_uid,
+            "sender_name":  sender_name,
+            "type":         "incoming_call",
+            "call_id":      call_id,
+            "call_type":    call_type,
+            "click_action": "FLUTTER_NOTIFICATION_CLICK",
+        }
+
+        msg = messaging.Message(
+            data=data_payload,
+            notification=messaging.Notification(
+                title="DDChat",
+                body=f"{'Видеозвонок' if call_type == 'video' else 'Звонок'} от {sender_name}",
+            ),
+            token=token,
+            android=messaging.AndroidConfig(
+                priority="high",
+                ttl=timedelta(seconds=60),  # звонок не ждёт долго
+                notification=messaging.AndroidNotification(
+                    channel_id="call_channel",
+                    default_vibrate_timings=True,
+                    default_sound=True,
+                    priority="max",
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10", "apns-push-type": "alert"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        badge=1,
+                        sound="default",
+                        content_available=True,
+                        category="INCOMING_CALL",
+                    )
+                ),
+            ),
+        )
+        await asyncio.get_event_loop().run_in_executor(None, messaging.send, msg)
+        logger.info(f"📲 Call push sent to {target_uid} from {from_uid} ({call_type})")
+    except Exception as e:
+        logger.error(f"❌ Call push error: {e}")
 
 # ─── Офлайн очереди ─────────────────────────────────────────────────────────
 async def _send_offline_messages(websocket: WebSocket, my_uid: str):
@@ -1115,6 +1171,70 @@ async def websocket_endpoint(websocket: WebSocket):
                         "from_uid":   my_uid,
                         "target_uid": target_uid,
                         "typing":     data.get("typing", False),
+                    })
+                continue
+
+            # ── ГОЛОСОВЫЕ / ВИДЕО ВЫЗОВЫ (WebRTC signaling) ────────────────────
+            # Сервер выступает только как сигнальный relay — пробрасывает SDP и
+            # ICE-кандидаты между пирами. Медиа идёт peer-to-peer через WebRTC.
+            if msg_type == "call_offer":
+                target_uid = data.get("target_uid")
+                call_id    = data.get("call_id")
+                if target_uid and call_id:
+                    payload = {
+                        "type":      "call_offer",
+                        "from_uid":  my_uid,
+                        "call_id":   call_id,
+                        "call_type": data.get("call_type", "audio"),  # audio | video
+                        "sdp":       data.get("sdp"),
+                    }
+                    # Пробуем доставить онлайн; если офлайн — шлём push
+                    if target_uid in active_connections:
+                        delivered = await _send_to(active_connections[target_uid], payload)
+                        if delivered:
+                            logger.info(f"📞 Call offer {call_id}: {my_uid} → {target_uid} (online)")
+                        else:
+                            await _send_fcm_call_push(target_uid, my_uid, call_id, data.get("call_type", "audio"))
+                    else:
+                        await _send_fcm_call_push(target_uid, my_uid, call_id, data.get("call_type", "audio"))
+                        logger.info(f"📞 Call offer {call_id}: {my_uid} → {target_uid} (offline, push sent)")
+                continue
+
+            if msg_type == "call_answer":
+                target_uid = data.get("target_uid")
+                call_id    = data.get("call_id")
+                if target_uid and call_id and target_uid in active_connections:
+                    await _send_to(active_connections[target_uid], {
+                        "type":     "call_answer",
+                        "from_uid": my_uid,
+                        "call_id":  call_id,
+                        "sdp":      data.get("sdp"),
+                    })
+                    logger.info(f"📞 Call answer {call_id}: {my_uid} → {target_uid}")
+                continue
+
+            if msg_type in ("call_reject", "call_end", "call_busy"):
+                target_uid = data.get("target_uid")
+                call_id    = data.get("call_id")
+                if target_uid and call_id and target_uid in active_connections:
+                    await _send_to(active_connections[target_uid], {
+                        "type":     msg_type,
+                        "from_uid": my_uid,
+                        "call_id":  call_id,
+                        "reason":   data.get("reason", ""),
+                    })
+                    logger.info(f"📞 {msg_type} {call_id}: {my_uid} → {target_uid}")
+                continue
+
+            if msg_type == "ice_candidate":
+                target_uid = data.get("target_uid")
+                call_id    = data.get("call_id")
+                if target_uid and call_id and target_uid in active_connections:
+                    await _send_to(active_connections[target_uid], {
+                        "type":      "ice_candidate",
+                        "from_uid":  my_uid,
+                        "call_id":   call_id,
+                        "candidate": data.get("candidate"),
                     })
                 continue
 
