@@ -1236,6 +1236,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "call_id":   call_id,
                         "candidate": data.get("candidate"),
                     })
+                elif target_uid and call_id:
+                    logger.warning(f"📞 ICE candidate lost: {target_uid} not online")
                 continue
 
             # ── ГРУППОВЫЕ КЛЮЧИ ───────────────────────────────────────────────────
