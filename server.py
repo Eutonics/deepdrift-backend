@@ -474,7 +474,18 @@ async def _store_offline_message(target_uid: str, message_data: dict):
         logger.error(f"❌ Failed to store offline message: {e}")
 
 # ─── Роутинг ────────────────────────────────────────────────────────────────
+async def _is_blocked(target_uid: str, from_uid: str) -> bool:
+    """Проверяет, заблокирован ли from_uid пользователем target_uid."""
+    if not redis_client:
+        return False
+    return await redis_client.sismember(f"blocked:{target_uid}", from_uid)
+
 async def _deliver_or_store(target_uid: str, payload: dict, push_type: str, from_uid: str, group_id: str = None):
+    # ── Проверка блокировки ─────────────────────────────────────────────────
+    if await _is_blocked(target_uid, from_uid):
+        logger.info(f"🚫 Message from {from_uid} blocked by {target_uid}")
+        return False
+
     # ── FIX: ВСЕГДА сохраняем в офлайн-очередь как страховку ─────────────
     # Проблема: _send_to() может вернуть True (TCP-буфер принял), но клиент
     # уже отключается — сообщение теряется. Сохранение "на всякий случай"
@@ -1098,6 +1109,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "fileSize":       data.get("fileSize"),
                     "mimeType":       data.get("mimeType"),
                     "group_id":       data.get("group_id"),
+                    "message_ttl":    data.get("message_ttl"),       # disappearing messages
+                    "forwarded_from": data.get("forwarded_from"),
                 }
                 payload = {k: v for k, v in raw_payload.items() if v is not None}
 
@@ -1166,12 +1179,37 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg_type == "typing_indicator":
                 target_uid = data.get("target_uid")
                 if target_uid and target_uid in active_connections:
-                    await _send_to(active_connections[target_uid], {
-                        "type":       "typing_indicator",
-                        "from_uid":   my_uid,
-                        "target_uid": target_uid,
-                        "typing":     data.get("typing", False),
-                    })
+                    # Не отправляем typing если заблокированы
+                    if not await _is_blocked(target_uid, my_uid):
+                        await _send_to(active_connections[target_uid], {
+                            "type":       "typing_indicator",
+                            "from_uid":   my_uid,
+                            "target_uid": target_uid,
+                            "typing":     data.get("typing", False),
+                        })
+                continue
+
+            # ── БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ ───────────────────────────────────
+            if msg_type == "block_user":
+                target_uid = data.get("target_uid")
+                if target_uid and redis_client:
+                    await redis_client.sadd(f"blocked:{my_uid}", target_uid)
+                    await _send_to(websocket, {"type": "user_blocked", "target_uid": target_uid})
+                    logger.info(f"🚫 {my_uid} blocked {target_uid}")
+                continue
+
+            if msg_type == "unblock_user":
+                target_uid = data.get("target_uid")
+                if target_uid and redis_client:
+                    await redis_client.srem(f"blocked:{my_uid}", target_uid)
+                    await _send_to(websocket, {"type": "user_unblocked", "target_uid": target_uid})
+                    logger.info(f"✅ {my_uid} unblocked {target_uid}")
+                continue
+
+            if msg_type == "get_blocked_list":
+                if redis_client:
+                    blocked = list(await redis_client.smembers(f"blocked:{my_uid}"))
+                    await _send_to(websocket, {"type": "blocked_list", "uids": blocked})
                 continue
 
             # ── ГОЛОСОВЫЕ / ВИДЕО ВЫЗОВЫ (WebRTC signaling) ────────────────────
@@ -1181,6 +1219,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 target_uid = data.get("target_uid")
                 call_id    = data.get("call_id")
                 if target_uid and call_id:
+                    # Блокировка: не пробрасываем звонок
+                    if await _is_blocked(target_uid, my_uid):
+                        await _send_to(websocket, {"type": "call_reject", "from_uid": target_uid, "call_id": call_id, "reason": "unavailable"})
+                        continue
                     payload = {
                         "type":      "call_offer",
                         "from_uid":  my_uid,
