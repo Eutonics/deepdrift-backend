@@ -1652,6 +1652,120 @@ async def websocket_endpoint(websocket: WebSocket):
                 await _send_to(websocket, {"type": "pong"})
                 continue
 
+            # ── STORIES / СТАТУСЫ ────────────────────────────────────────────
+            # Сторис хранятся в Redis с TTL 24 часа. Каждая история — хэш
+            # story:{id} с полями uid, text, media_id, type, created_at.
+            # stories:{uid} — sorted set story_id'ов по timestamp.
+
+            STORY_TTL = 86400  # 24 часа
+
+            if msg_type == "post_story":
+                if not redis_client:
+                    continue
+                story_id   = f"st_{uuid.uuid4().hex[:12]}"
+                story_type = data.get("story_type", "text")  # text | image | video
+                text       = data.get("text", "")
+                media_id   = data.get("media_id", "")
+                bg_color   = data.get("bg_color", "#1A1F3C")
+                now        = _now_ms()
+
+                story_data = {
+                    "uid":        my_uid,
+                    "text":       text,
+                    "media_id":   media_id,
+                    "story_type": story_type,
+                    "bg_color":   bg_color,
+                    "created_at": str(now),
+                }
+                await redis_client.hset(f"story:{story_id}", mapping=story_data)
+                await redis_client.expire(f"story:{story_id}", STORY_TTL)
+                await redis_client.zadd(f"stories:{my_uid}", {story_id: now})
+                await redis_client.expire(f"stories:{my_uid}", STORY_TTL + 3600)
+
+                await _send_to(websocket, {
+                    "type":     "story_posted",
+                    "story_id": story_id,
+                    **story_data,
+                })
+
+                # Уведомляем онлайн-контакты что появилась новая история
+                # (чтобы обновился кольцо на аватаре)
+                for uid, ws in active_connections.items():
+                    if uid != my_uid:
+                        await _send_to(ws, {
+                            "type":     "story_available",
+                            "uid":      my_uid,
+                            "story_id": story_id,
+                        })
+
+                logger.info(f"📸 Story posted by {my_uid}: {story_id} ({story_type})")
+                continue
+
+            if msg_type == "get_stories":
+                if not redis_client:
+                    continue
+                # Собираем истории всех контактов + свои
+                contact_uids = data.get("contacts", [])
+                if my_uid not in contact_uids:
+                    contact_uids.append(my_uid)
+
+                all_stories = []
+                for uid in contact_uids:
+                    story_ids = await redis_client.zrangebyscore(
+                        f"stories:{uid}",
+                        min=_now_ms() - STORY_TTL * 1000,
+                        max="+inf",
+                    )
+                    for sid in story_ids:
+                        story = await redis_client.hgetall(f"story:{sid}")
+                        if story:
+                            viewers = list(await redis_client.smembers(f"story_views:{sid}"))
+                            all_stories.append({
+                                "story_id":   sid,
+                                "uid":        story.get("uid", uid),
+                                "text":       story.get("text", ""),
+                                "media_id":   story.get("media_id", ""),
+                                "story_type": story.get("story_type", "text"),
+                                "bg_color":   story.get("bg_color", "#1A1F3C"),
+                                "created_at": int(story.get("created_at", "0")),
+                                "viewers":    viewers,
+                                "viewed_by_me": my_uid in viewers,
+                            })
+
+                await _send_to(websocket, {
+                    "type":    "stories_response",
+                    "stories": all_stories,
+                })
+                continue
+
+            if msg_type == "view_story":
+                story_id = data.get("story_id")
+                if redis_client and story_id:
+                    await redis_client.sadd(f"story_views:{story_id}", my_uid)
+                    await redis_client.expire(f"story_views:{story_id}", STORY_TTL + 3600)
+                    # Уведомляем автора
+                    story = await redis_client.hgetall(f"story:{story_id}")
+                    owner = story.get("uid")
+                    if owner and owner in active_connections:
+                        await _send_to(active_connections[owner], {
+                            "type":      "story_viewed",
+                            "story_id":  story_id,
+                            "viewer_uid": my_uid,
+                        })
+                continue
+
+            if msg_type == "delete_story":
+                story_id = data.get("story_id")
+                if redis_client and story_id:
+                    story = await redis_client.hgetall(f"story:{story_id}")
+                    if story.get("uid") == my_uid:
+                        await redis_client.delete(f"story:{story_id}")
+                        await redis_client.zrem(f"stories:{my_uid}", story_id)
+                        await redis_client.delete(f"story_views:{story_id}")
+                        await _send_to(websocket, {"type": "story_deleted", "story_id": story_id})
+                        logger.info(f"🗑️ Story deleted: {story_id} by {my_uid}")
+                continue
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
