@@ -1766,6 +1766,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.info(f"🗑️ Story deleted: {story_id} by {my_uid}")
                 continue
 
+            if msg_type == "react_story":
+                story_id = data.get("story_id")
+                emoji    = data.get("emoji", "❤️")
+                if redis_client and story_id:
+                    # Сохраняем реакцию: story_reactions:{story_id} — hash uid→emoji
+                    await redis_client.hset(f"story_reactions:{story_id}", my_uid, emoji)
+                    await redis_client.expire(f"story_reactions:{story_id}", STORY_TTL + 3600)
+                    # Уведомляем автора
+                    story = await redis_client.hgetall(f"story:{story_id}")
+                    owner = story.get("uid")
+                    if owner and owner in active_connections:
+                        await _send_to(active_connections[owner], {
+                            "type":       "story_reaction",
+                            "story_id":   story_id,
+                            "from_uid":   my_uid,
+                            "emoji":      emoji,
+                        })
+                    logger.info(f"💬 Story reaction: {my_uid} → {story_id} ({emoji})")
+                continue
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
