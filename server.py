@@ -1448,6 +1448,75 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"⭐ {my_uid} promoted {target_uid} in group {group_id}")
                 continue
 
+            if msg_type == "demote_admin":
+                group_id   = data.get("group_id")
+                target_uid = data.get("target_uid")
+                if redis_client and group_id and target_uid:
+                    admins = await redis_client.smembers(f"group_admins:{group_id}")
+                    if my_uid not in admins:
+                        await _send_to(websocket, {"type": "error", "message": "Not an admin"})
+                        continue
+                    await redis_client.srem(f"group_admins:{group_id}", target_uid)
+                    notify = {
+                        "type":     "group_admin_demoted",
+                        "group_id": group_id,
+                        "uid":      target_uid,
+                        "by_uid":   my_uid,
+                        "time":     _now_ms(),
+                    }
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    for member in members:
+                        if member in active_connections:
+                            await _send_to(active_connections[member], notify)
+                    logger.info(f"⬇️ {my_uid} demoted {target_uid} in group {group_id}")
+                continue
+
+            if msg_type == "update_group_info":
+                group_id = data.get("group_id")
+                if redis_client and group_id:
+                    admins = await redis_client.smembers(f"group_admins:{group_id}")
+                    if my_uid not in admins:
+                        await _send_to(websocket, {"type": "error", "message": "Not an admin"})
+                        continue
+                    updates = {}
+                    if "group_name" in data:
+                        await redis_client.set(f"group_name:{group_id}", data["group_name"])
+                        updates["group_name"] = data["group_name"]
+                    if "description" in data:
+                        await redis_client.hset(f"group_info:{group_id}", "description", data["description"])
+                        updates["description"] = data["description"]
+                    if "photo_id" in data:
+                        await redis_client.hset(f"group_info:{group_id}", "photo_id", data["photo_id"])
+                        updates["photo_id"] = data["photo_id"]
+                    # Уведомляем всех участников
+                    notify = {"type": "group_info_updated", "group_id": group_id, **updates, "time": _now_ms()}
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    for member in members:
+                        if member in active_connections:
+                            await _send_to(active_connections[member], notify)
+                    logger.info(f"📝 {my_uid} updated info for {group_id}: {list(updates.keys())}")
+                continue
+
+            if msg_type == "get_group_info":
+                group_id = data.get("group_id")
+                if redis_client and group_id:
+                    info     = await redis_client.hgetall(f"group_info:{group_id}") or {}
+                    settings = await redis_client.hgetall(f"group_settings:{group_id}") or {}
+                    members  = list(await redis_client.smembers(f"group:{group_id}"))
+                    admins   = list(await redis_client.smembers(f"group_admins:{group_id}"))
+                    name     = await redis_client.get(f"group_name:{group_id}") or group_id
+                    await _send_to(websocket, {
+                        "type":        "group_info_response",
+                        "group_id":    group_id,
+                        "group_name":  name,
+                        "description": info.get("description", ""),
+                        "photo_id":    info.get("photo_id", ""),
+                        "members":     members,
+                        "admins":      admins,
+                        "settings":    settings,
+                    })
+                continue
+
             # ── GROUP ADMIN SETTINGS ──────────────────────────────────────────
             if msg_type == "update_group_settings":
                 group_id = data.get("group_id")
@@ -1459,9 +1528,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     settings = {}
                     if "only_admins_post" in data:
                         settings["only_admins_post"] = "1" if data["only_admins_post"] else "0"
+                    if "only_admins_invite" in data:
+                        settings["only_admins_invite"] = "1" if data["only_admins_invite"] else "0"
+                    if "mute_members" in data:
+                        settings["mute_members"] = "1" if data["mute_members"] else "0"
                     if settings:
                         await redis_client.hset(f"group_settings:{group_id}", mapping=settings)
-                    await _send_to(websocket, {"type": "group_settings_updated", "group_id": group_id})
+                    # Уведомляем всех
+                    members = await redis_client.smembers(f"group:{group_id}")
+                    notify = {"type": "group_settings_updated", "group_id": group_id, "settings": settings, "time": _now_ms()}
+                    for member in members:
+                        if member in active_connections:
+                            await _send_to(active_connections[member], notify)
                     logger.info(f"⚙️ {my_uid} updated settings for {group_id}: {settings}")
                 continue
 
