@@ -727,7 +727,66 @@ async def _handle_force_register(websocket: WebSocket, uid: str, data: dict):
     logger.info(f"🔄 Force re-registered pubkey for {uid}")
 
 
+# ─── TURN Server (WebRTC relay) ─────────────────────────────────────────────
+# Для работы звонков через мобильный интернет нужен TURN-сервер.
+# Варианты:
+#   1. Свой coturn → TURN_SECRET = shared secret из turnserver.conf
+#   2. Metered.ca  → TURN_SECRET не нужен, TURN_URLS/USER/PASS из dashboard
+#
+# Env:
+#   TURN_URLS    — URL(ы) через запятую: turn:ip:3478,turns:ip:5349
+#   TURN_SECRET  — shared secret для HMAC-credentials (coturn --use-auth-secret)
+#   TURN_USER    — статический username (если не используешь HMAC)
+#   TURN_PASS    — статический пароль
+TURN_URLS   = os.environ.get("TURN_URLS", "")
+TURN_SECRET = os.environ.get("TURN_SECRET", "")
+TURN_USER   = os.environ.get("TURN_USER", "")
+TURN_PASS   = os.environ.get("TURN_PASS", "")
+TURN_TTL    = int(os.environ.get("TURN_TTL", "86400"))  # 24 часа
+
+if TURN_URLS:
+    logger.info(f"✅ TURN configured: {TURN_URLS.split(',')[0]}...")
+else:
+    logger.warning("⚠️ TURN not configured — voice/video calls may fail on mobile networks")
+
 # ─── REST endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/turn-credentials")
+async def get_turn_credentials(request: Request):
+    """Выдаёт временные TURN-credentials для WebRTC.
+    
+    Два режима:
+      1. HMAC (coturn --use-auth-secret): генерирует username=timestamp:uid, 
+         credential=HMAC-SHA1(secret, username). Credentials живут TURN_TTL секунд.
+      2. Static: возвращает TURN_USER/TURN_PASS как есть (для Metered.ca и подобных).
+    """
+    if not TURN_URLS:
+        return {"iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun1.l.google.com:19302"},
+        ]}
+    
+    urls = [u.strip() for u in TURN_URLS.split(",") if u.strip()]
+    
+    if TURN_SECRET:
+        # HMAC mode (coturn)
+        import hmac, hashlib
+        expiry = int(time.time()) + TURN_TTL
+        username = f"{expiry}:deepdrift"
+        credential = base64.b64encode(
+            hmac.new(TURN_SECRET.encode(), username.encode(), hashlib.sha1).digest()
+        ).decode()
+        return {"iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": urls, "username": username, "credential": credential},
+        ]}
+    else:
+        # Static mode (Metered.ca, Twilio)
+        return {"iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": urls, "username": TURN_USER, "credential": TURN_PASS},
+        ]}
+
 @app.get("/")
 async def root():
     return {
