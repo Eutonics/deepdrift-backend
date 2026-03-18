@@ -882,7 +882,10 @@ async def download_file(file_id: str, request: Request, token: str = None):
             return StreamingResponse(
                 io.BytesIO(body),
                 media_type=content_type,
-                headers={"Content-Disposition": f"attachment; filename={safe_file_id}"},
+                headers={
+                    "Content-Disposition": f"attachment; filename={safe_file_id}",
+                    "Content-Length": str(len(body)),
+                },
             )
         except ClientError as e:
             code = e.response["Error"]["Code"]
