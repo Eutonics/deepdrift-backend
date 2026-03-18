@@ -1618,6 +1618,111 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"📺 {my_uid} left channel {channel_id}")
                 continue
 
+            if msg_type == "get_channel_info":
+                channel_id = data.get("channel_id")
+                if redis_client and channel_id:
+                    meta = await redis_client.hgetall(f"channel:{channel_id}")
+                    if meta:
+                        sub_count = await redis_client.scard(f"channel_subs:{channel_id}")
+                        is_subscribed = await redis_client.sismember(f"channel_subs:{channel_id}", my_uid)
+                        await _send_to(websocket, {
+                            "type":           "channel_info_response",
+                            "channel_id":     channel_id,
+                            "channel_name":   meta.get("name", ""),
+                            "description":    meta.get("description", ""),
+                            "owner_uid":      meta.get("owner_uid", ""),
+                            "photo_id":       meta.get("photo_id", ""),
+                            "created_at":     meta.get("created_at", "0"),
+                            "subscriber_count": sub_count,
+                            "is_subscribed":  is_subscribed,
+                        })
+                continue
+
+            if msg_type == "edit_channel":
+                channel_id = data.get("channel_id")
+                if redis_client and channel_id:
+                    meta = await redis_client.hgetall(f"channel:{channel_id}")
+                    if meta.get("owner_uid") != my_uid:
+                        await _send_to(websocket, {"type": "error", "message": "Only the owner can edit"})
+                        continue
+                    updates = {}
+                    if "channel_name" in data and data["channel_name"].strip():
+                        updates["name"] = data["channel_name"].strip()
+                    if "description" in data:
+                        updates["description"] = data["description"].strip()
+                    if "photo_id" in data:
+                        updates["photo_id"] = data["photo_id"]
+                    if updates:
+                        await redis_client.hset(f"channel:{channel_id}", mapping=updates)
+                    await _send_to(websocket, {
+                        "type": "channel_updated",
+                        "channel_id": channel_id,
+                        **updates,
+                    })
+                    # Уведомляем подписчиков
+                    subs = await redis_client.smembers(f"channel_subs:{channel_id}")
+                    for sub in subs:
+                        if sub != my_uid and sub in active_connections:
+                            await _send_to(active_connections[sub], {
+                                "type": "channel_updated",
+                                "channel_id": channel_id,
+                                **updates,
+                            })
+                    logger.info(f"📺 Channel {channel_id} updated by {my_uid}: {updates}")
+                continue
+
+            if msg_type == "delete_channel":
+                channel_id = data.get("channel_id")
+                if redis_client and channel_id:
+                    meta = await redis_client.hgetall(f"channel:{channel_id}")
+                    if meta.get("owner_uid") != my_uid:
+                        await _send_to(websocket, {"type": "error", "message": "Only the owner can delete"})
+                        continue
+                    # Уведомляем подписчиков
+                    subs = await redis_client.smembers(f"channel_subs:{channel_id}")
+                    for sub in subs:
+                        if sub in active_connections:
+                            await _send_to(active_connections[sub], {
+                                "type": "channel_deleted",
+                                "channel_id": channel_id,
+                            })
+                    # Удаляем всё
+                    await redis_client.delete(f"channel:{channel_id}")
+                    await redis_client.delete(f"channel_subs:{channel_id}")
+                    await redis_client.delete(f"channel_history:{channel_id}")
+                    logger.info(f"🗑️ Channel {channel_id} deleted by {my_uid}")
+                continue
+
+            if msg_type == "get_my_channels":
+                if redis_client:
+                    # Сканируем все каналы на подписку
+                    # Для масштаба лучше хранить user_channels:{uid}, но для MVP — скан
+                    result = []
+                    cursor = 0
+                    while True:
+                        cursor, keys = await redis_client.scan(cursor, match="channel:*", count=100)
+                        for key in keys:
+                            cid = key.replace("channel:", "")
+                            is_sub = await redis_client.sismember(f"channel_subs:{cid}", my_uid)
+                            if is_sub:
+                                meta = await redis_client.hgetall(key)
+                                sub_count = await redis_client.scard(f"channel_subs:{cid}")
+                                result.append({
+                                    "channel_id":       cid,
+                                    "channel_name":     meta.get("name", ""),
+                                    "description":      meta.get("description", ""),
+                                    "owner_uid":        meta.get("owner_uid", ""),
+                                    "photo_id":         meta.get("photo_id", ""),
+                                    "subscriber_count": sub_count,
+                                })
+                        if cursor == 0:
+                            break
+                    await _send_to(websocket, {
+                        "type": "my_channels_response",
+                        "channels": result,
+                    })
+                continue
+
             if msg_type == "channel_message":
                 channel_id = data.get("channel_id")
                 text       = data.get("text", "").strip()
