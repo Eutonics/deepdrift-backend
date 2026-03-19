@@ -787,6 +787,18 @@ async def get_turn_credentials(request: Request):
             {"urls": urls, "username": TURN_USER, "credential": TURN_PASS},
         ]}
 
+@app.get("/check-uid/{uid}")
+async def check_uid(uid: str):
+    """Проверяет занят ли UID. Используется при регистрации до установки соединения."""
+    if not _is_valid_uid(uid):
+        return {"available": False, "reason": "invalid_format"}
+    if redis_client:
+        stored = await redis_client.get(f"auth:pubkey:{uid}")
+        taken = stored is not None
+    else:
+        taken = False
+    return {"available": not taken, "uid": uid}
+
 @app.get("/")
 async def root():
     return {
