@@ -447,26 +447,44 @@ async def _send_offline_messages_from(websocket: WebSocket, my_uid: str, from_ui
     try:
         offline_key = f"offline:{my_uid}:from:{from_uid}"
         messages = await redis_client.lrange(offline_key, 0, -1)
-        if messages:
-            logger.info(f"📬 Sending {len(messages)} messages from {from_uid} to {my_uid}")
-            success_count = 0
-            for msg_json in messages:
-                async with _connections_lock:
-                    current_ws = active_connections.get(my_uid)
-                if current_ws is not websocket:
-                    break
-                if await _send_to(websocket, json.loads(msg_json)):
-                    success_count += 1
-                else:
-                    break
-            if success_count > 0:
-                # ── FIX: повторная проверка перед trim ──────────────────────
-                async with _connections_lock:
-                    current_ws = active_connections.get(my_uid)
-                if current_ws is websocket:
-                    await redis_client.ltrim(offline_key, success_count, -1)
-                else:
-                    logger.info(f"⚠️ Skipping specific offline trim for {my_uid}: connection changed")
+        if not messages:
+            return
+
+        logger.info(f"📬 Sending {len(messages)} messages from {from_uid} to {my_uid}")
+        success_count = 0
+        delivered_msgs = []
+        for msg_json in messages:
+            async with _connections_lock:
+                current_ws = active_connections.get(my_uid)
+            if current_ws is not websocket:
+                break
+            if await _send_to(websocket, json.loads(msg_json)):
+                success_count += 1
+                delivered_msgs.append(msg_json)
+            else:
+                break
+
+        if success_count == 0:
+            return
+
+        # Повторная проверка перед trim
+        async with _connections_lock:
+            current_ws = active_connections.get(my_uid)
+        if current_ws is not websocket:
+            logger.info(f"⚠️ Skipping specific offline trim for {my_uid}: connection changed")
+            return
+
+        # Чистим per-sender очередь
+        await redis_client.ltrim(offline_key, success_count, -1)
+
+        # FIX: чистим глобальную очередь для доставленных сообщений.
+        # Без этого _send_offline_messages доставит те же сообщения повторно
+        # через 0.5с после подключения — двойная доставка — replay-детектор
+        # в крипто-сервисе выбрасывает дубль — пустые пузыри / потеря сообщений.
+        global_key = f"offline_queue:{my_uid}"
+        for msg_json in delivered_msgs:
+            await redis_client.lrem(global_key, 1, msg_json)
+
     except Exception as e:
         logger.error(f"❌ Error sending specific offline messages: {e}")
 
